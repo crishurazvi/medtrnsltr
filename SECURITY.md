@@ -1,37 +1,46 @@
 # Securitate
 
-## Ce date sunt introduse în browser
+## Cheia DeepSeek
 
-La autentificare, utilizatorul introduce:
+Cheia este:
 
-- Supabase Project URL;
-- Supabase Publishable Key;
-- email;
-- parolă.
+- introdusă de utilizator;
+- validată în browser;
+- păstrată în `sessionStorage`;
+- ștearsă la logout sau la închiderea filei;
+- trimisă prin HTTPS în headerul `x-deepseek-api-key` către Edge Function;
+- folosită numai pentru apelul curent către DeepSeek.
 
-URL-ul și cheia Publishable pot fi memorate opțional local în browser. Parola nu este salvată de aplicație; este trimisă direct către Supabase Auth prin clientul oficial Supabase JS.
+Cheia nu este scrisă în:
 
-## Chei permise
+- GitHub;
+- fișierele build-ului Render;
+- variabile de mediu Render;
+- tabelele Supabase;
+- Supabase Storage.
 
-- `sb_publishable_...`;
-- cheia legacy `anon` pentru proiecte vechi.
+Aceasta nu este echivalentă cu păstrarea într-un keychain de sistem. Orice cheie folosită de o aplicație web este accesibilă temporar în browser. Nu utiliza site-ul pe calculatoare publice și evită extensiile de browser necunoscute.
 
-## Chei interzise
+## Edge Function
+
+`deepseek-proxy` este deployată cu `verify_jwt = false` pentru a evita incompatibilitățile verificării JWT legacy cu cheile noi Supabase. Funcția nu este publică în sens practic: validează manual tokenul utilizatorului cu `supabase.auth.getUser()` înainte de orice apel DeepSeek.
+
+Funcția:
+
+- acceptă numai POST;
+- permite numai modelele `deepseek-v4-flash` și `deepseek-v4-pro`;
+- limitează dimensiunea prompturilor;
+- nu loghează cheia sau corpul cererii;
+- nu returnează cheia către client;
+- folosește `Cache-Control: no-store`.
+
+## Supabase
+
+În browser sunt permise numai Publishable Key sau cheia legacy `anon`. Nu introduce:
 
 - `sb_secret_...`;
 - `service_role`;
 - parola bazei de date;
-- connection string PostgreSQL;
-- chei AI.
+- connection string PostgreSQL.
 
-Aplicația verifică și refuză cele mai comune formate de chei privilegiate, dar utilizatorul rămâne responsabil să copieze cheia corectă.
-
-## Row Level Security
-
-Schema `supabase/schema.sql` activează RLS și limitează accesul fiecărui utilizator la propriile proiecte, segmente, intrări de glosar și PDF-uri.
-
-O cheie Publishable este destinată utilizării în aplicații publice, dar nu înlocuiește RLS. Nu dezactiva politicile incluse fără să înțelegi consecințele.
-
-## Hosting
-
-Render găzduiește doar fișiere statice. Nu există un backend Render, funcții serverless sau variabile de mediu care să conțină chei Supabase ori AI.
+Datele din tabele rămân protejate de politicile RLS din `supabase/schema.sql`.

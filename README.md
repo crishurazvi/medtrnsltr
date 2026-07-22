@@ -1,95 +1,44 @@
-# MedTranslate Studio — GitHub + Render + Supabase
+# MedTranslate Studio — DeepSeek Auto
 
-Aplicație web statică pentru traducerea manuală asistată a documentelor medicale PDF.
+Aplicație web pentru traducerea automată a documentelor medicale PDF, găzduită ca site static pe Render, cu datele salvate în Supabase.
 
-Nu există integrare cu DeepSeek, OpenAI, Claude sau alt API AI. Fluxul rămâne intenționat manual:
+## Flux
 
-1. încarci PDF-ul;
-2. textul este extras local în browser;
-3. aplicația împarte documentul în segmente;
-4. copiezi promptul și segmentul;
-5. le trimiți manual în instrumentul AI ales;
-6. lipești traducerea în editor;
-7. progresul se salvează în proiectul tău Supabase;
-8. exporți Markdown, HTML, backup JSON sau PDF prin Print.
+1. utilizatorul introduce Supabase URL, Publishable Key, contul și cheia DeepSeek;
+2. cheia DeepSeek este păstrată numai în `sessionStorage`, până la închiderea filei;
+3. PDF-ul este extras și împărțit local în browser;
+4. aplicația trimite secvențial fiecare segment către funcția `deepseek-proxy` din Supabase;
+5. funcția validează sesiunea utilizatorului și redirecționează cererea către DeepSeek;
+6. fiecare traducere este salvată imediat în tabelul `chunks`;
+7. traducerea poate fi oprită și reluată fără pierderea progresului.
 
-## Ce s-a schimbat în această versiune
-
-- proiect pregătit pentru repository GitHub;
-- deploy automat pe Render ca **Static Site**;
-- configurație Render inclusă în `render.yaml`;
-- build explicit în `build.sh` și publicare din folderul `dist`;
-- nu mai există `config.js`;
-- ecranul de autentificare cere:
-  - Supabase Project URL;
-  - Supabase Publishable Key;
-  - email;
-  - parolă;
-- URL-ul și cheia Publishable pot fi reținute opțional în browser;
-- aplicația refuză cheile `sb_secret_...` și JWT-urile `service_role`;
-- conexiunea Supabase poate fi schimbată din bara de sus.
+Copy–paste-ul manual a fost păstrat ca rezervă.
 
 ## Fișiere importante
 
-- `index.html` — intrarea aplicației;
-- `styles.css` — interfața;
-- `js/app.js` — logica aplicației;
-- `js/connection.js` — validarea și memorarea conexiunii Supabase;
-- `js/db.js` — accesul la Supabase;
-- `js/pdf-tools.js` — extragerea și segmentarea PDF-ului;
-- `js/export-tools.js` — exporturile;
-- `supabase/schema.sql` — schema bazei, RLS și Storage;
-- `build.sh` — copiază fișierele publicabile în `dist`;
-- `render.yaml` — configurarea automată Render;
-- `TUTORIAL_GITHUB_RENDER_SUPABASE.md` — ghidul complet.
+- `js/app.js` — autentificare, interfață și coada de traducere;
+- `js/deepseek-session.js` — validarea și stocarea temporară a cheii;
+- `js/db.js` — apelul funcției Supabase și operațiile bazei de date;
+- `supabase/functions/deepseek-proxy/index.ts` — proxy-ul autentificat către DeepSeek;
+- `supabase/config.toml` — dezactivează verificarea JWT legacy; funcția validează manual utilizatorul;
+- `MODIFICARI_GITHUB_DEEPSEEK.md` — instalarea exactă.
 
-## Testare locală
+## Modele
 
-Nu deschide direct `index.html` prin dublu click, deoarece modulele JavaScript au nevoie de HTTP.
+- `deepseek-v4-flash` — implicit și recomandat pentru traducere;
+- `deepseek-v4-pro` — opțional.
 
-```bash
-python -m http.server 8080
-```
+Apelul folosește modul non-thinking pentru a evita cost și latență inutile la traducere.
 
-Apoi deschide:
+## Build Render
+
+Configurarea Render nu se schimbă:
 
 ```text
-http://localhost:8080
+Build Command: bash build.sh
+Publish Directory: ./dist
 ```
 
-Pentru a testa exact build-ul Render:
+## Limitări de securitate
 
-```bash
-bash build.sh
-python -m http.server 8080 --directory dist
-```
-
-## Deploy rapid pe Render
-
-1. urcă toate fișierele în rădăcina unui repository GitHub;
-2. în Render alege `New > Blueprint`;
-3. conectează repository-ul;
-4. Render citește `render.yaml` și publică folderul `dist`;
-5. după deploy, introdu în aplicație URL-ul și cheia Publishable Supabase.
-
-Instrucțiunile complete sunt în [TUTORIAL_GITHUB_RENDER_SUPABASE.md](./TUTORIAL_GITHUB_RENDER_SUPABASE.md).
-
-## Securitate
-
-Cheia Supabase **Publishable** este destinată utilizării în browser. Datele sunt protejate de autentificare și politicile Row Level Security din `supabase/schema.sql`.
-
-Nu introduce niciodată în aplicație:
-
-- cheia `sb_secret_...`;
-- cheia legacy `service_role`;
-- parola bazei de date;
-- un connection string PostgreSQL;
-- chei DeepSeek, OpenAI, Anthropic sau alte secrete.
-
-## Limitări
-
-- nu include OCR pentru PDF-uri scanate;
-- nu păstrează fidel layoutul original al PDF-ului;
-- imaginile și tabelele complexe nu sunt reconstruite automat;
-- bibliotecile PDF.js, Supabase JS, Marked și DOMPurify sunt încărcate de pe jsDelivr;
-- datele conexiunii Supabase sunt specifice browserului/dispozitivului în care au fost introduse.
+Cheia DeepSeek nu este salvată în GitHub, Render, Supabase Database sau Storage. Totuși, cât timp fila este deschisă, cheia există în browser și poate fi văzută de codul care rulează pe acel origin, de extensii malițioase sau în Network DevTools. Folosește aplicația numai pe dispozitive de încredere și setează limite de credit în contul DeepSeek.

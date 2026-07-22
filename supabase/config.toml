@@ -1,0 +1,2 @@
+[functions.deepseek-proxy]
+verify_jwt = false
