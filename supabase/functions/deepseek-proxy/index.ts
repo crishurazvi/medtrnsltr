@@ -1,9 +1,12 @@
 import { createClient } from "npm:@supabase/supabase-js@^2";
+import { corsHeaders as sdkCorsHeaders } from "npm:@supabase/supabase-js@^2/cors";
 
+// Pornim de la lista oficială Supabase și adăugăm headerul nostru temporar.
+// Astfel rămânem compatibili și când supabase-js introduce headere noi.
 const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-deepseek-api-key",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  ...sdkCorsHeaders,
+  "Access-Control-Allow-Headers": `${sdkCorsHeaders["Access-Control-Allow-Headers"]}, x-deepseek-api-key`,
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
 };
 
 const jsonHeaders = {
@@ -32,6 +35,12 @@ function safeErrorMessage(payload, fallback) {
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
+  }
+
+  // Endpoint simplu pentru a verifica în browser dacă funcția există.
+  // Nu expune secrete și nu apelează DeepSeek.
+  if (req.method === "GET") {
+    return json({ ok: true, function: "deepseek-proxy", version: 2 });
   }
 
   if (req.method !== "POST") {

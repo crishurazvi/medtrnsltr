@@ -43,6 +43,10 @@ export async function invokeDeepSeekTranslation({ apiKey, model, systemPrompt, u
       // Păstrăm mesajul standard oferit de supabase-js.
     }
 
+    if (/Failed to send a request to the Edge Function/i.test(message)) {
+      message = "Nu pot contacta funcția Supabase «deepseek-proxy». Verifică dacă este publicată în același proiect Supabase introdus la login și dacă numele este exact deepseek-proxy. După publicare, reîncarcă pagina.";
+    }
+
     const wrapped = new Error(message);
     wrapped.status = Number(status) || 0;
     throw wrapped;
