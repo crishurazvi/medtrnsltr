@@ -20,11 +20,11 @@ export function getSupabase() {
 }
 
 export async function invokeDeepSeekTranslation({ apiKey, model, systemPrompt, userPrompt }) {
+  // Cheia DeepSeek este trimisă numai în corpul cererii HTTPS.
+  // Nu este salvată în Supabase și evităm un header custom care declanșa probleme CORS.
   const { data, error } = await getSupabase().functions.invoke("deepseek-proxy", {
-    headers: {
-      "x-deepseek-api-key": apiKey,
-    },
     body: {
+      deepseek_api_key: apiKey,
       model,
       system_prompt: systemPrompt,
       user_prompt: userPrompt,
@@ -40,11 +40,11 @@ export async function invokeDeepSeekTranslation({ apiKey, model, systemPrompt, u
       if (payload?.error) message = payload.error;
       if (payload?.status) status = payload.status;
     } catch {
-      // Păstrăm mesajul standard oferit de supabase-js.
+      // Păstrăm mesajul oferit de supabase-js dacă răspunsul nu este JSON.
     }
 
     if (/Failed to send a request to the Edge Function/i.test(message)) {
-      message = "Nu pot contacta funcția Supabase «deepseek-proxy». Verifică dacă este publicată în același proiect Supabase introdus la login și dacă numele este exact deepseek-proxy. După publicare, reîncarcă pagina.";
+      message = "Browserul nu a putut apela Edge Function. Înlocuiește codul funcției cu versiunea CORS fix și apasă Deploy function.";
     }
 
     const wrapped = new Error(message);
