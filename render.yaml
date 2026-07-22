@@ -2,26 +2,31 @@ services:
   - type: web
     name: medtranslate-studio
     runtime: static
-    plan: free
     buildCommand: bash build.sh
     staticPublishPath: ./dist
     autoDeployTrigger: commit
+
     headers:
       - path: /*
         name: X-Content-Type-Options
         value: nosniff
+
       - path: /*
         name: X-Frame-Options
         value: DENY
+
       - path: /*
         name: Referrer-Policy
         value: strict-origin-when-cross-origin
+
       - path: /*
         name: Permissions-Policy
         value: camera=(), microphone=(), geolocation=()
+
       - path: /*
         name: Content-Security-Policy
         value: "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; connect-src 'self' https://*.supabase.co wss://*.supabase.co https://cdn.jsdelivr.net; worker-src 'self' blob: https://cdn.jsdelivr.net; img-src 'self' data: blob:; font-src 'self' data:; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+
     routes:
       - type: rewrite
         source: /*
