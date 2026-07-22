@@ -1,32 +1,46 @@
-# Fix CORS DeepSeek
+# Fix pentru „DeepSeek nu a returnat o traducere validă”
 
-## GitHub
-Înlocuiește fișierul:
+Acest patch repară două lucruri:
 
-- `js/db.js`
+1. aplicația acceptă atât răspunsul normalizat `{ translation: ... }`, cât și răspunsul brut DeepSeek;
+2. dacă DeepSeek chiar întoarce conținut gol, mesajul afișează `finish_reason`, structura răspunsului și trace ID-ul, fără a afișa cheia API.
 
-Fă commit și așteaptă redeploy-ul automat Render.
+## 1. GitHub
 
-## Supabase Dashboard
-Mergi la:
+Înlocuiește:
 
-`Edge Functions → deepseek-proxy → Edit function`
+```text
+js/db.js
+```
+
+Fă Commit și așteaptă deploy-ul Render.
+
+## 2. Supabase
+
+Intră la:
+
+```text
+Edge Functions → deepseek-proxy → Edit
+```
 
 Înlocuiește tot codul cu:
 
-- `supabase/functions/deepseek-proxy/index.ts`
+```text
+supabase/functions/deepseek-proxy/index.ts
+```
 
 Apasă **Deploy function**.
 
-În setările funcției păstrează **Verify JWT with legacy secret = OFF**.
+Păstrează `Verify JWT with legacy secret` pe OFF.
 
-## Test
-Deschide în browser:
+## 3. Verificare
 
-`https://PROJECT_REF.supabase.co/functions/v1/deepseek-proxy`
+Deschide:
 
-Trebuie să apară:
+```text
+https://PROJECT_REF.supabase.co/functions/v1/deepseek-proxy
+```
 
-`{"ok":true,"function":"deepseek-proxy","version":3}`
+Trebuie să vezi `"version":4`.
 
-Apoi fă `Ctrl+Shift+R` pe site și reîncearcă segmentele netraduse.
+Apoi fă `Ctrl + Shift + R` pe site și reîncearcă segmentele netraduse.

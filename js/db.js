@@ -1,4 +1,9 @@
-import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm";
+import {
+  createClient,
+  FunctionsFetchError,
+  FunctionsHttpError,
+  FunctionsRelayError,
+} from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm";
 import { chunkArray } from "./utils.js";
 
 let client;
@@ -20,8 +25,6 @@ export function getSupabase() {
 }
 
 export async function invokeDeepSeekTranslation({ apiKey, model, systemPrompt, userPrompt }) {
-  // Cheia DeepSeek este trimisă numai în corpul cererii HTTPS.
-  // Nu este salvată în Supabase și evităm un header custom care declanșa probleme CORS.
   const { data, error } = await getSupabase().functions.invoke("deepseek-proxy", {
     body: {
       deepseek_api_key: apiKey,
@@ -33,30 +36,99 @@ export async function invokeDeepSeekTranslation({ apiKey, model, systemPrompt, u
 
   if (error) {
     let message = error.message || "Apelul către funcția DeepSeek a eșuat.";
-    let status = error.context?.status || 0;
+    let status = 0;
+    let payload = null;
 
-    try {
-      const payload = await error.context?.clone?.().json?.();
-      if (payload?.error) message = payload.error;
-      if (payload?.status) status = payload.status;
-    } catch {
-      // Păstrăm mesajul oferit de supabase-js dacă răspunsul nu este JSON.
-    }
+    if (error instanceof FunctionsHttpError) {
+      status = Number(error.context?.status || 0);
+      try {
+        payload = await error.context.clone().json();
+      } catch {
+        try {
+          const text = await error.context.clone().text();
+          if (text) message = text.slice(0, 700);
+        } catch {
+          // Păstrăm mesajul SDK-ului.
+        }
+      }
 
-    if (/Failed to send a request to the Edge Function/i.test(message)) {
-      message = "Browserul nu a putut apela Edge Function. Înlocuiește codul funcției cu versiunea CORS fix și apasă Deploy function.";
+      if (payload?.error) message = String(payload.error);
+      if (payload?.status) status = Number(payload.status);
+      if (payload?.diagnostic) {
+        const diagnostic = JSON.stringify(payload.diagnostic);
+        message += ` | Diagnostic: ${diagnostic.slice(0, 900)}`;
+      }
+      if (payload?.trace_id) message += ` | Trace: ${payload.trace_id}`;
+    } else if (error instanceof FunctionsFetchError) {
+      message = "Browserul nu a putut contacta funcția Supabase deepseek-proxy.";
+    } else if (error instanceof FunctionsRelayError) {
+      message = `Supabase Relay: ${message}`;
     }
 
     const wrapped = new Error(message);
-    wrapped.status = Number(status) || 0;
+    wrapped.status = status;
     throw wrapped;
   }
 
-  if (!data?.translation || typeof data.translation !== "string") {
-    throw new Error("DeepSeek nu a returnat o traducere validă.");
+  let payload = data;
+
+  if (typeof payload === "string") {
+    try {
+      payload = JSON.parse(payload);
+    } catch {
+      if (payload.trim()) {
+        return { translation: payload.trim(), usage: null, model };
+      }
+    }
   }
 
-  return data;
+  if (payload?.ok === false || payload?.error) {
+    const wrapped = new Error(String(payload.error || "Funcția DeepSeek a returnat o eroare."));
+    wrapped.status = Number(payload.status || 0);
+    throw wrapped;
+  }
+
+  // Acceptăm atât răspunsul normalizat al funcției, cât și un răspuns
+  // DeepSeek brut. Astfel, o versiune veche a funcției nu mai produce
+  // falsul mesaj „traducere invalidă”.
+  const rawContent =
+    payload?.translation ??
+    payload?.choices?.[0]?.message?.content ??
+    payload?.choices?.[0]?.text ??
+    payload?.output_text;
+
+  let translation = "";
+  if (typeof rawContent === "string") {
+    translation = rawContent.trim();
+  } else if (Array.isArray(rawContent)) {
+    translation = rawContent
+      .map((part) => {
+        if (typeof part === "string") return part;
+        if (typeof part?.text === "string") return part.text;
+        if (typeof part?.content === "string") return part.content;
+        return "";
+      })
+      .join("")
+      .trim();
+  }
+
+  if (!translation) {
+    const preview = (() => {
+      try {
+        return JSON.stringify(payload).slice(0, 900);
+      } catch {
+        return String(payload).slice(0, 900);
+      }
+    })();
+    throw new Error(`Răspuns primit de la funcție, dar fără câmpul traducerii. Răspuns: ${preview}`);
+  }
+
+  return {
+    ...payload,
+    translation,
+    usage: payload?.usage || null,
+    model: payload?.model || model,
+  };
 }
 
 export async function getSession() {
