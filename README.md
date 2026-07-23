@@ -60,14 +60,9 @@ supabase/phase1_chapters.sql
 
 în Supabase Dashboard → SQL Editor. Nu este necesară nicio modificare a funcției `deepseek-proxy` dacă traducerea automată funcționează deja.
 
-## Faza 2 — Wiki Editor
+## Faza 3 — Notițe și highlight-uri
 
-Faza 2 adaugă un editor rich-text separat pentru fiecare concept din tabul **Capitole**. Conținutul extras este păstrat în `content_original`, iar versiunea utilizatorului este salvată în `content_edited` cu autosave și revizii numerotate.
-
-Pentru instalare, rulează după Faza 1:
-
-```text
-supabase/phase2_concept_editor.sql
-```
-
-Instrucțiunile complete sunt în `FAZA2_EDITOR_GITHUB.md`.
+Versiunea include acum highlight-uri semantice în editorul conceptelor și un
+editor separat de notițe personale, ambele cu autosave. Pentru instalare peste
+Faza 2, urmează `FAZA3_NOTITE_HIGHLIGHTS_GITHUB.md` și rulează
+`supabase/phase3_notes_highlights.sql`.

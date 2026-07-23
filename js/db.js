@@ -244,6 +244,15 @@ export async function saveConceptEditor(conceptId, contentHtml) {
   return Array.isArray(data) ? data[0] : data;
 }
 
+export async function saveConceptNotes(conceptId, notesHtml) {
+  const { data, error } = await getSupabase().rpc("save_concept_notes", {
+    p_concept_id: conceptId,
+    p_notes_html: notesHtml || "",
+  });
+  if (error) throw error;
+  return Array.isArray(data) ? data[0] : data;
+}
+
 export async function replaceProjectKnowledge(projectId, chapters) {
   const payload = {
     chapters: (chapters ?? []).map((chapter, chapterIndex) => ({

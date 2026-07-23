@@ -684,3 +684,145 @@ a { color: inherit; }
   color: #6d7f89;
   cursor: not-allowed;
 }
+
+/* Faza 3 — notițe personale și highlight-uri semantice */
+.concept-tree-dot.has-notes {
+  box-shadow: 0 0 0 3px rgba(80, 92, 167, .14);
+  background: #5966a7;
+}
+.concept-tree-dot.edited.has-notes {
+  background: linear-gradient(135deg, var(--accent) 0 48%, #5966a7 52% 100%);
+  box-shadow: 0 0 0 3px rgba(89, 102, 167, .12);
+}
+
+.highlight-tool {
+  min-width: auto;
+  border-color: rgba(31, 45, 61, .08);
+  font-size: 10px;
+}
+.highlight-tool::before {
+  width: 8px;
+  height: 8px;
+  margin-right: 5px;
+  border-radius: 999px;
+  content: "";
+}
+.highlight-important::before { background: #ffd766; }
+.highlight-definition::before { background: #92e0d5; }
+.highlight-example::before { background: #b9d7ff; }
+.highlight-review::before { background: #ffb5b5; }
+
+.highlight-summary {
+  padding: 8px 13px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  border-bottom: 1px solid var(--border);
+  background: #fbfcfd;
+}
+.highlight-count {
+  padding: 4px 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: white;
+  color: #526773;
+  font-size: 10px;
+  font-weight: 750;
+}
+.highlight-count i {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+}
+.highlight-count.important i { background: #ffd766; }
+.highlight-count.definition i { background: #92e0d5; }
+.highlight-count.example i { background: #b9d7ff; }
+.highlight-count.review i { background: #ffb5b5; }
+.highlight-count strong { color: var(--navy); }
+
+.concept-rich-editor mark[data-highlight] {
+  padding: .08em .12em;
+  border-radius: 3px;
+  color: inherit;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+.concept-rich-editor mark[data-highlight="important"] { background: #fff0a8; }
+.concept-rich-editor mark[data-highlight="definition"] {
+  background: #c9f2ec;
+  border-bottom: 2px solid #33a89a;
+}
+.concept-rich-editor mark[data-highlight="example"] { background: #dcecff; }
+.concept-rich-editor mark[data-highlight="review"] {
+  background: #ffe0e0;
+  border-bottom: 2px dashed #d25353;
+}
+
+.concept-notes-card {
+  overflow: hidden;
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: 0 5px 20px rgba(23, 50, 77, .045);
+}
+.concept-notes-header {
+  padding: 15px 17px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  border-bottom: 1px solid var(--border);
+  background: #faf9ff;
+}
+.concept-notes-header h3 { margin: 0; color: var(--navy); font-size: 15px; }
+.concept-notes-header p { margin: 4px 0 0; color: var(--muted); font-size: 11px; }
+.notes-toolbar {
+  padding: 7px 10px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  border-bottom: 1px solid var(--border);
+  background: white;
+}
+.concept-notes-editor {
+  min-height: 180px;
+  max-height: 420px;
+  overflow: auto;
+  padding: 18px 22px 24px;
+  color: #334155;
+  font-size: 14px;
+  line-height: 1.65;
+  outline: none;
+  overflow-wrap: anywhere;
+  caret-color: #5966a7;
+}
+.concept-notes-editor:focus { box-shadow: inset 0 0 0 2px rgba(89, 102, 167, .10); }
+.concept-notes-editor:empty::before {
+  content: attr(data-placeholder);
+  color: #9aa9b2;
+  pointer-events: none;
+}
+.concept-notes-editor p { margin: 0 0 10px; }
+.concept-notes-editor ul,
+.concept-notes-editor ol { margin: 7px 0 12px 22px; padding: 0; }
+.concept-notes-editor a { color: #176fb5; text-decoration: underline; }
+.concept-notes-editor.disabled {
+  background: #f6f8f9;
+  color: #6d7f89;
+  cursor: not-allowed;
+}
+
+@media (max-width: 760px) {
+  .highlight-tool { font-size: 0; min-width: 31px; }
+  .highlight-tool::before { margin-right: 0; width: 11px; height: 11px; }
+  .highlight-summary { flex-wrap: nowrap; overflow-x: auto; }
+  .highlight-count { flex: 0 0 auto; }
+  .concept-notes-header { flex-direction: column; align-items: stretch; }
+  .notes-toolbar { flex-wrap: nowrap; overflow-x: auto; }
+  .concept-notes-editor { min-height: 160px; max-height: none; padding: 16px 17px 22px; }
+}
