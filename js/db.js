@@ -262,6 +262,46 @@ export async function getProjectKnowledge(projectId) {
 }
 
 
+export async function getProjectLectureSections(projectId) {
+  const { data, error } = await getSupabase()
+    .from("lecture_sections")
+    .select("*")
+    .eq("project_id", projectId)
+    .eq("is_archived", false)
+    .order("position", { ascending: true });
+  if (error) throw error;
+  return data ?? [];
+}
+
+export async function syncProjectLectureSections(projectId, sections) {
+  const payload = (sections ?? []).map((section, index) => ({
+    section_key: String(section.section_key || `section-${index}`),
+    position: Number.isInteger(section.position) ? section.position : index,
+    title: String(section.title || `Secțiune ${index + 1}`),
+    heading_level: Number(section.heading_level || 0),
+    source_markdown: String(section.source_markdown || ""),
+    source_chunk_ids: Array.isArray(section.source_chunk_ids) ? section.source_chunk_ids : [],
+    source_fingerprint: String(section.source_fingerprint || ""),
+  }));
+
+  const { data, error } = await getSupabase().rpc("sync_project_lecture_sections", {
+    p_project_id: projectId,
+    p_sections: payload,
+  });
+  if (error) throw error;
+  return Array.isArray(data) ? data : [];
+}
+
+export async function saveLectureSection(sectionId, contentHtml) {
+  const { data, error } = await getSupabase().rpc("save_lecture_section", {
+    p_section_id: sectionId,
+    p_content_html: contentHtml || "",
+  });
+  if (error) throw error;
+  return Array.isArray(data) ? data[0] : data;
+}
+
+
 export async function saveConceptEditor(conceptId, contentHtml) {
   const { data, error } = await getSupabase().rpc("save_concept_editor", {
     p_concept_id: conceptId,

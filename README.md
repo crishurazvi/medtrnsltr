@@ -1,44 +1,26 @@
-# MedTranslate Studio — Faza 4 Personal Wiki
+# MedTranslate Studio
 
-Aplicație web statică pentru traducerea documentelor medicale, organizarea lor pe capitole și concepte și construirea unei biblioteci Wiki personale.
+Aplicație web statică pentru traducerea PDF-urilor medicale, organizarea lor într-un wiki personal și lectura în format de curs paginat.
 
-## Fluxul complet
+## Funcții principale
 
-```text
-PDF
-→ extragere și segmentare locală
-→ traducere DeepSeek
-→ Markdown salvat în Supabase
-→ capitole și concepte
-→ editor individual, notițe și highlights
-→ Bibliotecă și Viewing Mode Wiki
-```
+- PDF → extragere locală și segmentare;
+- traducere manuală copy/paste sau automată prin DeepSeek;
+- salvare în Supabase cu RLS;
+- capitole și concepte generate din traduceri;
+- editor rich-text pentru concepte;
+- notițe personale și highlights semantice;
+- Bibliotecă Wiki globală;
+- **Lecture Mode full-screen** numai din traduceri, cu pagini orizontale;
+- două pagini pe desktop, una pe mobil;
+- editarea și autosalvarea secțiunilor Lecture;
+- temă dark globală;
+- export Markdown, HTML, JSON și print/PDF.
 
-## Faza 4
+## Deploy
 
-- bibliotecă globală cu toate proiectele;
-- căutare în cursuri, concepte, note și traduceri;
-- pagină Wiki pentru fiecare proiect;
-- capitole și subcapitole colapsabile;
-- afișarea traducerii Markdown fără duplicarea segmentelor;
-- păstrarea paginilor de concept editate în HTML;
-- păstrarea underline-ului, highlights-urilor și notițelor;
-- acces direct din Wiki în editorul conceptului;
-- navigare prin URL către proiect și concept.
+- frontend static: GitHub → Render;
+- date și autentificare: Supabase;
+- proxy DeepSeek: Supabase Edge Function.
 
-## Hosting
-
-Proiectul rămâne un site static Render:
-
-```text
-Build Command: bash build.sh
-Publish Directory: ./dist
-```
-
-Nu sunt necesare variabile de mediu Render.
-
-## Baza de date
-
-Faza 4 nu adaugă tabele. Folosește schema Fazelor 1–3 și politicile RLS existente.
-
-Vezi `FAZA4_WIKI_LIBRARY_GITHUB.md` pentru instalare.
+Pentru upgrade-ul curent vezi `FAZA5_LECTURE_MODE_GITHUB.md` și rulează `supabase/phase5_lecture_mode.sql`.

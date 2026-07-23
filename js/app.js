@@ -7,6 +7,7 @@ import {
   getProject,
   getProjectChunks,
   getProjectKnowledge,
+  getProjectLectureSections,
   getSession,
   importBackup,
   initSupabase,
@@ -19,9 +20,11 @@ import {
   resetPassword,
   saveConceptEditor,
   saveConceptNotes,
+  saveLectureSection,
   signIn,
   signOut,
   signUp,
+  syncProjectLectureSections,
   updateChunk,
   updatePassword,
   updateProject,
@@ -44,6 +47,10 @@ import {
 } from "./deepseek-session.js";
 import { DEFAULT_SYSTEM_PROMPT, CHUNK_STATUS } from "./constants.js";
 import { buildChunks, extractPdf } from "./pdf-tools.js";
+import {
+  buildLectureSourceSections,
+  lectureSectionsNeedSync,
+} from "./lecture-tools.js";
 import {
   exportBackup,
   exportHtml,
@@ -92,6 +99,13 @@ const state = {
   wikiCollapsedChapters: new Set(),
   wikiCollapsedConcepts: new Set(),
   wikiFocusConceptId: null,
+  lectureSections: [],
+  lectureSetupError: null,
+  lectureCurrentSpread: 0,
+  lectureEditingSectionId: null,
+  lectureFontScale: 1,
+  lectureSyncing: false,
+  theme: localStorage.getItem("medtranslate-theme") === "dark" ? "dark" : "light",
   knowledge: {
     running: false,
     stopRequested: false,
@@ -117,8 +131,11 @@ const state = {
 let saveDebounced;
 let conceptSaveDebounced;
 let conceptNotesSaveDebounced;
+let lectureSaveDebounced;
 let conceptEditorSelection = null;
 let conceptNotesSelection = null;
+let lectureEditorSelection = null;
+let lectureResizeTimer = null;
 let authSubscription;
 
 function ensureToastRegion() {
@@ -153,6 +170,35 @@ function closeModal() {
   document.querySelector("#modal-root")?.remove();
 }
 
+function applyTheme(theme) {
+  const next = theme === "dark" ? "dark" : "light";
+  state.theme = next;
+  document.documentElement.dataset.theme = next;
+  localStorage.setItem("medtranslate-theme", next);
+  document.querySelector('meta[name="theme-color"]')?.setAttribute(
+    "content",
+    next === "dark" ? "#0b1218" : "#0f766e",
+  );
+  document.querySelectorAll("[data-theme-toggle]").forEach((button) => {
+    button.textContent = next === "dark" ? "☀ Mod luminos" : "☾ Mod întunecat";
+    button.title = next === "dark" ? "Activează tema luminoasă" : "Activează tema întunecată";
+  });
+}
+
+function toggleTheme() {
+  applyTheme(state.theme === "dark" ? "light" : "dark");
+}
+
+function themeToggleButton(extraClass = "") {
+  return `<button class="btn btn-ghost btn-sm ${extraClass}" data-theme-toggle type="button">${state.theme === "dark" ? "☀ Mod luminos" : "☾ Mod întunecat"}</button>`;
+}
+
+function attachThemeListeners() {
+  document.querySelectorAll("[data-theme-toggle]").forEach((button) => {
+    button.addEventListener("click", toggleTheme);
+  });
+}
+
 function topbar({ editor = false } = {}) {
   const email = state.session?.user?.email ?? "";
   const supabaseHost = connectionHostname(state.connection);
@@ -167,12 +213,14 @@ function topbar({ editor = false } = {}) {
         ${editor ? '<button id="back-dashboard" class="btn btn-ghost btn-sm">← Bibliotecă</button>' : ""}
         <button id="change-deepseek" class="btn btn-ghost btn-sm" title="Cheia este păstrată numai până închizi fila">✦ ${escapeHtml(deepseekLabel)}</button>
         <button id="change-supabase" class="btn btn-ghost btn-sm" title="Schimbă proiectul Supabase">◉ ${escapeHtml(supabaseHost)}</button>
+        ${themeToggleButton()}
         <span class="user-pill">${escapeHtml(email)}</span>
         <button id="logout" class="btn btn-ghost btn-sm">Deconectare</button>
       </div>
     </header>`;
 }
 function attachTopbarListeners() {
+  attachThemeListeners();
   document.querySelector("#logout")?.addEventListener("click", async () => {
     try {
       await flushActiveEdits();
@@ -206,6 +254,9 @@ function attachTopbarListeners() {
     state.chunks = [];
     state.chapters = [];
     state.concepts = [];
+    state.lectureSections = [];
+    state.lectureSetupError = null;
+    state.lectureEditingSectionId = null;
     state.projectView = "translation";
     state.selectedConceptId = null;
     state.libraryKnowledge = { chapters: [], concepts: [] };
@@ -218,6 +269,7 @@ function attachTopbarListeners() {
   });
 }
 function renderAuth() {
+  document.body.classList.remove("lecture-active");
   const isSignup = state.authMode === "signup";
   const connection = state.connection ?? loadSavedConnection() ?? {
     supabaseUrl: "",
@@ -230,6 +282,7 @@ function renderAuth() {
   const rememberConnection = hasRememberedConnection();
 
   app.innerHTML = `
+    <button class="auth-theme-toggle btn btn-ghost btn-sm" data-theme-toggle type="button">${state.theme === "dark" ? "☀ Mod luminos" : "☾ Mod întunecat"}</button>
     <main class="auth-page">
       <section class="auth-visual">
         <div class="brand-mark">M</div>
@@ -309,6 +362,8 @@ function renderAuth() {
         </form>
       </section>
     </main>`;
+
+  attachThemeListeners();
 
   document.querySelectorAll(".toggle-secret").forEach((button) => {
     button.addEventListener("click", () => {
@@ -464,8 +519,10 @@ function renderDeepSeekGate(session) {
         <p class="setup-steps">Sesiunea Supabase este activă, dar această filă nu are o cheie DeepSeek temporară. Cheia nu va fi salvată în GitHub, Render sau Supabase.</p>
         <button id="open-deepseek-gate" class="btn btn-primary">Introdu cheia DeepSeek</button>
         <button id="gate-logout" class="btn btn-ghost" style="margin-left:8px">Deconectare</button>
+        <div style="margin-top:12px">${themeToggleButton()}</div>
       </section>
     </main>`;
+  attachThemeListeners();
   document.querySelector("#open-deepseek-gate")?.addEventListener("click", () => showDeepSeekSettingsModal({ required: true }));
   document.querySelector("#gate-logout")?.addEventListener("click", async () => {
     clearDeepSeekSession();
@@ -637,6 +694,7 @@ function renderProjectManagementCards() {
         <small>${project.translatedCount}/${project.chunkCount} traduse · ${chapters.length} capitole · ${concepts.length} concepte</small>
         <div class="project-card-actions">
           <button class="btn btn-ghost btn-sm open-wiki" data-id="${project.id}">Wiki</button>
+          <button class="btn btn-accent btn-sm open-lecture" data-id="${project.id}">Lecture</button>
           <button class="btn btn-primary btn-sm open-project" data-id="${project.id}">Editor</button>
           <button class="btn btn-danger btn-sm delete-project" data-id="${project.id}" title="Șterge proiectul">Șterge</button>
         </div>
@@ -691,6 +749,7 @@ function renderLibraryCards() {
           <span>Actualizat ${escapeHtml(formatDateShort(project.updated_at))}</span>
           <div>
             <button class="btn btn-ghost btn-sm open-project" data-id="${project.id}">Editor</button>
+            <button class="btn btn-accent btn-sm open-lecture" data-id="${project.id}">Lecture Mode</button>
             <button class="btn btn-primary btn-sm open-wiki" data-id="${project.id}">Citește în Wiki →</button>
           </div>
         </div>
@@ -700,6 +759,7 @@ function renderLibraryCards() {
 }
 
 function renderDashboard() {
+  document.body.classList.remove("lecture-active");
   const totalChunks = state.projects.reduce((sum, project) => sum + project.chunkCount, 0);
   const translatedChunks = state.projects.reduce((sum, project) => sum + project.translatedCount, 0);
   const totalConcepts = state.libraryKnowledge.concepts.length;
@@ -783,6 +843,9 @@ function renderDashboard() {
   });
   document.querySelectorAll(".open-wiki").forEach((button) => {
     button.addEventListener("click", () => openProject(button.dataset.id, { view: "wiki" }));
+  });
+  document.querySelectorAll(".open-lecture").forEach((button) => {
+    button.addEventListener("click", () => openProject(button.dataset.id, { view: "lecture" }));
   });
   document.querySelectorAll("[data-open-wiki]").forEach((button) => {
     button.addEventListener("click", () => openProject(button.dataset.openWiki, {
@@ -1045,11 +1108,14 @@ async function openProject(projectId, { view = "translation", conceptId = null }
   attachTopbarListeners();
 
   try {
-    const [project, chunks, glossary, knowledge] = await Promise.all([
+    const [project, chunks, glossary, knowledge, lecture] = await Promise.all([
       getProject(projectId),
       getProjectChunks(projectId),
       listGlossary(),
       getProjectKnowledge(projectId).catch((error) => ({ chapters: [], concepts: [], setupError: error })),
+      getProjectLectureSections(projectId)
+        .then((sections) => ({ sections, setupError: null }))
+        .catch((error) => ({ sections: [], setupError: error })),
     ]);
     state.currentProject = project;
     state.chunks = chunks;
@@ -1057,12 +1123,16 @@ async function openProject(projectId, { view = "translation", conceptId = null }
     state.chapters = knowledge.chapters;
     state.concepts = knowledge.concepts;
     state.knowledgeSetupError = knowledge.setupError || null;
+    state.lectureSections = lecture.sections || [];
+    state.lectureSetupError = lecture.setupError || null;
+    state.lectureCurrentSpread = 0;
+    state.lectureEditingSectionId = null;
     state.currentIndex = Math.max(0, state.chunks.findIndex((chunk) => chunk.status !== "approved"));
     if (state.currentIndex < 0) state.currentIndex = 0;
     state.chunkSearch = "";
     state.knowledgeSearch = "";
     state.wikiSearch = "";
-    state.projectView = ["translation", "chapters", "wiki"].includes(view) ? view : "translation";
+    state.projectView = ["translation", "chapters", "wiki", "lecture"].includes(view) ? view : "translation";
     state.selectedConceptId = state.concepts.some((concept) => concept.id === conceptId)
       ? conceptId
       : state.concepts[0]?.id ?? null;
@@ -1070,6 +1140,13 @@ async function openProject(projectId, { view = "translation", conceptId = null }
     state.collapsedChapters = new Set();
     state.wikiCollapsedChapters = new Set();
     state.wikiCollapsedConcepts = new Set();
+    if (state.projectView === "lecture" && !state.lectureSetupError && !state.lectureSections.length) {
+      try {
+        await ensureLectureSections({ quiet: true });
+      } catch {
+        // Lecture Mode va afișa instrucțiunea sau eroarea fără să blocheze proiectul.
+      }
+    }
     syncProjectHash();
     renderEditor();
   } catch (error) {
@@ -1325,6 +1402,9 @@ function projectViewTabs() {
     <button class="project-tab ${state.projectView === "wiki" ? "active" : ""}" data-project-view="wiki">
       <span>📖 Wiki</span><small>lectură continuă · ${state.chapters.length} capitole</small>
     </button>
+    <button class="project-tab ${state.projectView === "lecture" ? "active" : ""}" data-project-view="lecture">
+      <span>▣ Lecture Mode</span><small>pagini orizontale · doar traducerile</small>
+    </button>
     <button class="project-tab ${state.projectView === "translation" ? "active" : ""}" data-project-view="translation">
       <span>Traducere</span><small>${translatedCount}/${state.chunks.length} segmente</small>
     </button>
@@ -1341,6 +1421,13 @@ function attachProjectViewTabs() {
       if (!nextView || nextView === state.projectView) return;
       await flushActiveEdits();
       state.projectView = nextView;
+      if (nextView === "lecture" && !state.lectureSetupError && !state.lectureSections.length) {
+        try {
+          await ensureLectureSections({ quiet: true });
+        } catch {
+          // renderLectureView va afișa problema fără să blocheze restul proiectului.
+        }
+      }
       if (["chapters", "wiki"].includes(nextView) && !state.selectedConceptId) {
         state.selectedConceptId = state.concepts[0]?.id ?? null;
       }
@@ -2048,6 +2135,7 @@ async function flushCurrentConcept() {
 async function flushActiveEdits() {
   await flushCurrentChunk();
   await flushCurrentConcept();
+  await flushCurrentLectureSection();
 }
 
 function storeConceptEditorSelection(editor) {
@@ -2744,7 +2832,568 @@ function renderWikiView() {
   }
 }
 
+function lectureSourceSections() {
+  return buildLectureSourceSections(state.chunks.filter((chunk) => chunk.translated_text?.trim()));
+}
+
+function lectureNeedsSync() {
+  return lectureSectionsNeedSync(state.lectureSections, lectureSourceSections());
+}
+
+async function ensureLectureSections({ force = false, quiet = false } = {}) {
+  if (!state.currentProject) return [];
+  if (state.lectureSetupError) throw state.lectureSetupError;
+
+  const generated = lectureSourceSections();
+  if (!generated.length) {
+    state.lectureSections = [];
+    return [];
+  }
+  if (!force && state.lectureSections.length && !lectureSectionsNeedSync(state.lectureSections, generated)) {
+    return state.lectureSections;
+  }
+
+  state.lectureSyncing = true;
+  if (!quiet) toast("Construiesc paginile Lecture Mode din traduceri…", "default", 2200);
+  try {
+    state.lectureSections = await syncProjectLectureSections(state.currentProject.id, generated);
+    state.lectureSetupError = null;
+    state.lectureCurrentSpread = 0;
+    if (!quiet) toast("Lecture Mode a fost sincronizat cu traducerile.", "success");
+    return state.lectureSections;
+  } catch (error) {
+    state.lectureSetupError = error;
+    if (!quiet) toast(error.message || "Nu am putut construi Lecture Mode.", "error", 5200);
+    throw error;
+  } finally {
+    state.lectureSyncing = false;
+  }
+}
+
+function lectureSectionHtml(section) {
+  if (section?.content_edited?.trim()) return sanitizeConceptHtml(section.content_edited);
+  return markdownToWikiHtml(section?.source_markdown || "");
+}
+
+function lectureBlockWeight(node) {
+  const textLength = (node.textContent || "").trim().length;
+  const tag = node.nodeType === Node.ELEMENT_NODE ? node.tagName : "";
+  let weight = Math.max(60, textLength);
+  if (/^H[1-6]$/.test(tag)) weight += 310;
+  if (tag === "TABLE") weight += 520 + node.querySelectorAll("tr").length * 120;
+  if (tag === "PRE") weight += 260;
+  if (["UL", "OL"].includes(tag)) weight += node.querySelectorAll("li").length * 45;
+  if (tag === "BLOCKQUOTE") weight += 150;
+  return weight;
+}
+
+function buildLecturePages() {
+  const pages = [];
+  const capacity = Math.max(1500, Math.round(2850 / state.lectureFontScale));
+
+  state.lectureSections.forEach((section) => {
+    const holder = document.createElement("div");
+    holder.innerHTML = lectureSectionHtml(section);
+    const blocks = [...holder.childNodes]
+      .filter((node) => node.nodeType !== Node.TEXT_NODE || node.textContent.trim())
+      .map((node) => node.nodeType === Node.TEXT_NODE ? `<p>${escapeHtml(node.textContent)}</p>` : node.outerHTML);
+
+    const sectionPages = [];
+    let currentBlocks = [];
+    let currentWeight = 0;
+
+    const flushPage = () => {
+      if (!currentBlocks.length) return;
+      sectionPages.push(currentBlocks.join(""));
+      currentBlocks = [];
+      currentWeight = 0;
+    };
+
+    blocks.forEach((html) => {
+      const measure = document.createElement("div");
+      measure.innerHTML = html;
+      const weight = lectureBlockWeight(measure.firstChild || measure);
+      if (currentBlocks.length && currentWeight + weight > capacity) flushPage();
+      currentBlocks.push(html);
+      currentWeight += weight;
+    });
+    flushPage();
+    if (!sectionPages.length) sectionPages.push("<p><br></p>");
+
+    sectionPages.forEach((html, pageIndex) => {
+      pages.push({
+        section,
+        html,
+        pageIndex,
+        pageCount: sectionPages.length,
+      });
+    });
+  });
+
+  return pages.map((page, index) => ({ ...page, documentPage: index + 1 }));
+}
+
+function lectureSpreads(pages) {
+  const pagesPerSpread = window.matchMedia("(min-width: 900px)").matches ? 2 : 1;
+  const spreads = [];
+  for (let index = 0; index < pages.length; index += pagesPerSpread) {
+    spreads.push(pages.slice(index, index + pagesPerSpread));
+  }
+  return { spreads, pagesPerSpread };
+}
+
+function lecturePageHtml(page, totalPages) {
+  const edited = Number(page.section.manual_revision || 0) > 0;
+  return `<article class="lecture-page" data-lecture-section-page="${page.section.id}">
+    <header class="lecture-page-head">
+      <div>
+        <span>${escapeHtml(page.section.title)}</span>
+        ${page.pageCount > 1 ? `<small>partea ${page.pageIndex + 1}/${page.pageCount}</small>` : ""}
+      </div>
+      <div class="lecture-page-actions">
+        ${page.section.source_changed ? '<span class="badge warning" title="Traducerea sursă s-a modificat după editarea acestei secțiuni">sursa modificată</span>' : ""}
+        ${edited ? '<span class="badge primary">editată</span>' : ""}
+        <button class="btn btn-ghost btn-sm lecture-edit-section" data-section-id="${page.section.id}" type="button">Editează</button>
+      </div>
+    </header>
+    <div class="lecture-page-content wiki-rich-content" style="font-size:${state.lectureFontScale}em">${page.html}</div>
+    <footer class="lecture-page-footer">
+      <span>${escapeHtml(state.currentProject?.title || "Curs")}</span>
+      <strong>${page.documentPage} / ${totalPages}</strong>
+    </footer>
+  </article>`;
+}
+
+function setLectureSaveState(label, className = "") {
+  const element = document.querySelector("#lecture-save-state");
+  if (!element) return;
+  element.textContent = label;
+  element.className = `save-state ${className}`;
+}
+
+async function persistLectureSectionById(sectionId, { quiet = false } = {}) {
+  const section = state.lectureSections.find((item) => item.id === sectionId);
+  if (!section || !section._editorDirty) return section;
+  setLectureSaveState("Se salvează…", "saving");
+  try {
+    const sanitized = sanitizeConceptHtml(section.content_edited || "");
+    const saved = await saveLectureSection(section.id, sanitized);
+    if (!saved) throw new Error("Supabase nu a returnat secțiunea salvată.");
+    Object.assign(section, saved, { _editorDirty: false });
+    setLectureSaveState("Salvat", "saved");
+    const revision = document.querySelector("#lecture-revision");
+    const timestamp = document.querySelector("#lecture-last-saved");
+    if (revision) revision.textContent = `revizia ${Number(section.manual_revision || 0)}`;
+    if (timestamp) timestamp.textContent = `ultima salvare: ${formatConceptEditorTimestamp(section.editor_updated_at)}`;
+    if (!quiet) toast("Secțiunea Lecture a fost salvată.", "success", 1800);
+    return section;
+  } catch (error) {
+    setLectureSaveState("Eroare la salvare", "");
+    toast(error.message || "Nu am putut salva secțiunea Lecture.", "error");
+    throw error;
+  }
+}
+
+async function flushCurrentLectureSection() {
+  lectureSaveDebounced?.cancel?.();
+  const dirty = state.lectureSections.filter((section) => section._editorDirty);
+  for (const section of dirty) await persistLectureSectionById(section.id, { quiet: true });
+}
+
+function storeLectureEditorSelection(editor) {
+  const selection = window.getSelection();
+  if (!selection?.rangeCount) return;
+  const range = selection.getRangeAt(0);
+  if (editor.contains(range.commonAncestorContainer)) lectureEditorSelection = range.cloneRange();
+}
+
+function restoreLectureEditorSelection(editor) {
+  if (!lectureEditorSelection) {
+    editor.focus();
+    return;
+  }
+  const selection = window.getSelection();
+  selection.removeAllRanges();
+  selection.addRange(lectureEditorSelection);
+}
+
+function runLectureEditorCommand(editor, command, value = null) {
+  restoreLectureEditorSelection(editor);
+  document.execCommand(command, false, value);
+  storeLectureEditorSelection(editor);
+  editor.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+function applyLectureHighlight(editor, type) {
+  if (!CONCEPT_HIGHLIGHT_TYPES.has(type)) return false;
+  restoreLectureEditorSelection(editor);
+  const selection = window.getSelection();
+  if (!selection?.rangeCount || selection.isCollapsed) {
+    toast("Selectează textul pe care vrei să-l evidențiezi.", "error");
+    return false;
+  }
+  const range = selection.getRangeAt(0);
+  if (!editor.contains(range.commonAncestorContainer)) return false;
+  const startBlock = closestEditorBlock(range.startContainer, editor);
+  const endBlock = closestEditorBlock(range.endContainer, editor);
+  if (startBlock !== endBlock) {
+    toast("Selectează text dintr-un singur paragraf sau element de listă.", "error", 4200);
+    return false;
+  }
+  const fragment = range.extractContents();
+  fragment.querySelectorAll?.("mark[data-highlight]").forEach(unwrapNode);
+  const mark = document.createElement("mark");
+  mark.dataset.highlight = type;
+  mark.appendChild(fragment);
+  range.insertNode(mark);
+  selection.removeAllRanges();
+  const nextRange = document.createRange();
+  nextRange.selectNodeContents(mark);
+  selection.addRange(nextRange);
+  lectureEditorSelection = nextRange.cloneRange();
+  editor.dispatchEvent(new Event("input", { bubbles: true }));
+  return true;
+}
+
+function clearLectureHighlight(editor) {
+  restoreLectureEditorSelection(editor);
+  const selection = window.getSelection();
+  if (!selection?.rangeCount) return false;
+  const range = selection.getRangeAt(0);
+  const marks = [...editor.querySelectorAll("mark[data-highlight]")].filter((mark) => {
+    try { return range.intersectsNode(mark); } catch { return false; }
+  });
+  if (!marks.length) {
+    toast("Selecția nu conține niciun highlight.", "error", 2400);
+    return false;
+  }
+  marks.forEach(unwrapNode);
+  lectureEditorSelection = null;
+  editor.dispatchEvent(new Event("input", { bubbles: true }));
+  return true;
+}
+
+function renderLectureSectionEditor(section) {
+  const initialHtml = section.content_edited?.trim()
+    ? sanitizeConceptHtml(section.content_edited)
+    : markdownToWikiHtml(section.source_markdown);
+
+  return `<div class="lecture-edit-overlay">
+    <header class="lecture-edit-header">
+      <div>
+        <span class="lecture-kicker">Editare Lecture Mode</span>
+        <h2>${escapeHtml(section.title)}</h2>
+        <div class="lecture-edit-meta">
+          <span id="lecture-revision">revizia ${Number(section.manual_revision || 0)}</span>
+          <span id="lecture-last-saved">ultima salvare: ${formatConceptEditorTimestamp(section.editor_updated_at)}</span>
+          ${section.source_changed ? '<span class="badge warning">traducerea sursă s-a schimbat</span>' : ""}
+        </div>
+      </div>
+      <div class="lecture-edit-header-actions">
+        <span id="lecture-save-state" class="save-state saved">Salvat</span>
+        <button id="save-lecture-now" class="btn btn-primary btn-sm" type="button">Salvează</button>
+        <button id="close-lecture-editor" class="btn btn-ghost btn-sm" type="button">Înapoi la pagini</button>
+      </div>
+    </header>
+    <div class="lecture-editor-toolbar concept-toolbar" role="toolbar" aria-label="Formatarea secțiunii Lecture">
+      <button class="btn btn-ghost btn-sm lecture-tool" data-lecture-command="bold" title="Bold"><strong>B</strong></button>
+      <button class="btn btn-ghost btn-sm lecture-tool" data-lecture-command="italic" title="Italic"><em>I</em></button>
+      <button class="btn btn-ghost btn-sm lecture-tool" data-lecture-command="underline" title="Subliniere"><u>U</u></button>
+      <button class="btn btn-ghost btn-sm lecture-tool" data-lecture-command="strikeThrough" title="Tăiat"><s>S</s></button>
+      <span class="toolbar-divider"></span>
+      <button class="btn btn-ghost btn-sm lecture-tool" data-lecture-block="h2">Titlu</button>
+      <button class="btn btn-ghost btn-sm lecture-tool" data-lecture-block="h3">Subtitlu</button>
+      <button class="btn btn-ghost btn-sm lecture-tool" data-lecture-block="p">Paragraf</button>
+      <button class="btn btn-ghost btn-sm lecture-tool" data-lecture-command="insertUnorderedList">• Listă</button>
+      <button class="btn btn-ghost btn-sm lecture-tool" data-lecture-command="insertOrderedList">1. Listă</button>
+      <button class="btn btn-ghost btn-sm lecture-tool" data-lecture-block="blockquote">Citat</button>
+      <button id="lecture-add-link" class="btn btn-ghost btn-sm lecture-tool">Link</button>
+      <span class="toolbar-divider"></span>
+      <button class="highlight-button important lecture-tool" data-lecture-highlight="important">Important</button>
+      <button class="highlight-button definition lecture-tool" data-lecture-highlight="definition">Definiție</button>
+      <button class="highlight-button example lecture-tool" data-lecture-highlight="example">Exemplu</button>
+      <button class="highlight-button review lecture-tool" data-lecture-highlight="review">De revăzut</button>
+      <button id="clear-lecture-highlight" class="btn btn-ghost btn-sm lecture-tool">Fără highlight</button>
+      <span class="toolbar-divider"></span>
+      <button class="btn btn-ghost btn-sm lecture-tool" data-lecture-command="undo">↶</button>
+      <button class="btn btn-ghost btn-sm lecture-tool" data-lecture-command="redo">↷</button>
+      <button class="btn btn-ghost btn-sm lecture-tool" data-lecture-command="removeFormat">Curăță formatul</button>
+    </div>
+    <main class="lecture-editor-stage">
+      <article id="lecture-section-editor" class="lecture-section-editor wiki-rich-content" contenteditable="true" spellcheck="true">${initialHtml}</article>
+    </main>
+    <footer class="lecture-edit-footer">
+      <span id="lecture-word-count">${conceptWordCount(initialHtml)} cuvinte</span>
+      <div>
+        <button id="reset-lecture-source" class="btn btn-ghost btn-sm" type="button">Revino la traducerea Markdown</button>
+        ${themeToggleButton()}
+      </div>
+    </footer>
+  </div>`;
+}
+
+function renderLectureView() {
+  const project = state.currentProject;
+  if (!project) return;
+  document.body.classList.add("lecture-active");
+
+  if (state.lectureEditingSectionId) {
+    const section = state.lectureSections.find((item) => item.id === state.lectureEditingSectionId);
+    if (!section) state.lectureEditingSectionId = null;
+    else {
+      app.innerHTML = `<div class="lecture-mode lecture-editor-mode">${renderLectureSectionEditor(section)}</div>`;
+      attachLectureEditorListeners(section);
+      return;
+    }
+  }
+
+  const generated = lectureSourceSections();
+  const hasTranslations = generated.length > 0;
+  const needsSync = !state.lectureSetupError && lectureSectionsNeedSync(state.lectureSections, generated);
+
+  if (state.lectureSetupError) {
+    app.innerHTML = `<div class="lecture-mode lecture-empty-mode">
+      <div class="lecture-empty-card">
+        <span class="lecture-kicker">Faza 5</span>
+        <h1>Activează Lecture Mode în Supabase</h1>
+        <p>Rulează fișierul <code>supabase/phase5_lecture_mode.sql</code> în SQL Editor, apoi reîncarcă pagina.</p>
+        <div class="error-box">${escapeHtml(state.lectureSetupError.message || "Tabela lecture_sections nu este disponibilă.")}</div>
+        <div><button id="exit-lecture" class="btn btn-primary">Înapoi la proiect</button> ${themeToggleButton()}</div>
+      </div>
+    </div>`;
+    attachThemeListeners();
+    document.querySelector("#exit-lecture")?.addEventListener("click", () => {
+      state.projectView = "wiki";
+      syncProjectHash();
+      renderEditor();
+    });
+    return;
+  }
+
+  if (!hasTranslations) {
+    app.innerHTML = `<div class="lecture-mode lecture-empty-mode">
+      <div class="lecture-empty-card"><span class="lecture-kicker">Lecture Mode</span><h1>Nu există încă traduceri</h1><p>Tradu mai întâi cel puțin un segment. Lecture Mode folosește exclusiv câmpul de traducere și ignoră conceptele.</p><button id="exit-lecture" class="btn btn-primary">Mergi la traducere</button></div>
+    </div>`;
+    document.querySelector("#exit-lecture")?.addEventListener("click", () => {
+      state.projectView = "translation";
+      syncProjectHash();
+      renderEditor();
+    });
+    return;
+  }
+
+  if (!state.lectureSections.length) {
+    app.innerHTML = `<div class="lecture-mode lecture-empty-mode">
+      <div class="lecture-empty-card"><span class="lecture-kicker">Lecture Mode</span><h1>Construiește cursul paginat</h1><p>Traducerile vor fi separate după headerele Markdown și salvate ca secțiuni editabile.</p><button id="build-lecture" class="btn btn-primary" ${state.lectureSyncing ? "disabled" : ""}>${state.lectureSyncing ? "Se construiește…" : "Construiește Lecture Mode"}</button><button id="exit-lecture" class="btn btn-ghost">Înapoi</button></div>
+    </div>`;
+    document.querySelector("#build-lecture")?.addEventListener("click", async () => {
+      await ensureLectureSections({ force: true });
+      renderEditor();
+    });
+    document.querySelector("#exit-lecture")?.addEventListener("click", () => {
+      state.projectView = "wiki";
+      syncProjectHash();
+      renderEditor();
+    });
+    return;
+  }
+
+  const pages = buildLecturePages();
+  const { spreads } = lectureSpreads(pages);
+  state.lectureCurrentSpread = Math.min(Math.max(0, state.lectureCurrentSpread), Math.max(0, spreads.length - 1));
+  const sectionFirstSpread = new Map();
+  spreads.forEach((spread, spreadIndex) => spread.forEach((page) => {
+    if (!sectionFirstSpread.has(page.section.id)) sectionFirstSpread.set(page.section.id, spreadIndex);
+  }));
+
+  const spreadsHtml = spreads.map((spread, spreadIndex) => `<section class="lecture-spread" data-spread-index="${spreadIndex}">
+    ${spread.map((page) => lecturePageHtml(page, pages.length)).join("")}
+    ${spread.length === 1 && window.matchMedia("(min-width: 900px)").matches ? '<article class="lecture-page lecture-page-blank" aria-hidden="true"></article>' : ""}
+  </section>`).join("");
+
+  app.innerHTML = `<div class="lecture-mode" tabindex="-1">
+    <header class="lecture-toolbar">
+      <div class="lecture-toolbar-left">
+        <button id="exit-lecture" class="btn btn-ghost btn-sm" type="button">← Ieși</button>
+        <div class="lecture-title"><span>Lecture Mode</span><strong>${escapeHtml(project.title)}</strong></div>
+      </div>
+      <div class="lecture-toolbar-center">
+        <button id="lecture-prev" class="btn btn-ghost btn-sm" type="button">←</button>
+        <span id="lecture-spread-label">${state.lectureCurrentSpread + 1} / ${spreads.length}</span>
+        <button id="lecture-next" class="btn btn-ghost btn-sm" type="button">→</button>
+        <select id="lecture-section-jump" class="select lecture-section-select" aria-label="Sari la secțiune">
+          ${state.lectureSections.map((section) => `<option value="${section.id}">${escapeHtml(section.title)}</option>`).join("")}
+        </select>
+      </div>
+      <div class="lecture-toolbar-right">
+        ${needsSync ? '<span class="badge warning">traduceri modificate</span>' : ""}
+        <button id="sync-lecture" class="btn btn-ghost btn-sm" type="button" ${state.lectureSyncing ? "disabled" : ""}>↻ Sincronizează</button>
+        <button id="lecture-browser-fullscreen" class="btn btn-ghost btn-sm" type="button" title="Comută afișarea pe tot ecranul">⛶ Fullscreen</button>
+        <button id="lecture-font-down" class="btn btn-ghost btn-sm" type="button" title="Micșorează textul">A−</button>
+        <button id="lecture-font-up" class="btn btn-ghost btn-sm" type="button" title="Mărește textul">A+</button>
+        ${themeToggleButton()}
+      </div>
+    </header>
+    <main id="lecture-scroller" class="lecture-scroller">
+      <div id="lecture-track" class="lecture-track">${spreadsHtml}</div>
+    </main>
+    <footer class="lecture-bottom-bar">
+      <span>${pages.length} pagini · ${state.lectureSections.length} secțiuni</span>
+      <span>Folosește ← →, rotița mouse-ului sau swipe pentru răsfoire</span>
+    </footer>
+  </div>`;
+
+  attachLectureViewListeners({ spreads, sectionFirstSpread });
+  requestAnimationFrame(() => {
+    const scroller = document.querySelector("#lecture-scroller");
+    if (scroller) scroller.scrollLeft = state.lectureCurrentSpread * scroller.clientWidth;
+  });
+}
+
+function attachLectureViewListeners({ spreads, sectionFirstSpread }) {
+  attachThemeListeners();
+  const mode = document.querySelector(".lecture-mode");
+  const scroller = document.querySelector("#lecture-scroller");
+  const label = document.querySelector("#lecture-spread-label");
+
+  const goToSpread = (index, behavior = "smooth") => {
+    const next = Math.min(Math.max(0, index), Math.max(0, spreads.length - 1));
+    state.lectureCurrentSpread = next;
+    scroller?.scrollTo({ left: next * scroller.clientWidth, behavior });
+    if (label) label.textContent = `${next + 1} / ${spreads.length}`;
+  };
+
+  document.querySelector("#exit-lecture")?.addEventListener("click", async () => {
+    await flushCurrentLectureSection();
+    state.projectView = "wiki";
+    state.lectureEditingSectionId = null;
+    syncProjectHash();
+    renderEditor();
+  });
+  document.querySelector("#lecture-prev")?.addEventListener("click", () => goToSpread(state.lectureCurrentSpread - 1));
+  document.querySelector("#lecture-next")?.addEventListener("click", () => goToSpread(state.lectureCurrentSpread + 1));
+  document.querySelector("#lecture-section-jump")?.addEventListener("change", (event) => {
+    goToSpread(sectionFirstSpread.get(event.target.value) || 0);
+  });
+  document.querySelector("#sync-lecture")?.addEventListener("click", async () => {
+    if (state.lectureSections.some((section) => section._editorDirty)) await flushCurrentLectureSection();
+    await ensureLectureSections({ force: true });
+    renderEditor();
+  });
+  document.querySelector("#lecture-browser-fullscreen")?.addEventListener("click", async () => {
+    try {
+      if (document.fullscreenElement) await document.exitFullscreen();
+      else await document.documentElement.requestFullscreen();
+    } catch {
+      toast("Browserul nu a permis modul fullscreen.", "error");
+    }
+  });
+  document.querySelector("#lecture-font-down")?.addEventListener("click", () => {
+    state.lectureFontScale = Math.max(0.82, Number((state.lectureFontScale - 0.08).toFixed(2)));
+    renderEditor();
+  });
+  document.querySelector("#lecture-font-up")?.addEventListener("click", () => {
+    state.lectureFontScale = Math.min(1.35, Number((state.lectureFontScale + 0.08).toFixed(2)));
+    renderEditor();
+  });
+  document.querySelectorAll(".lecture-edit-section").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.lectureEditingSectionId = button.dataset.sectionId;
+      lectureEditorSelection = null;
+      renderEditor();
+    });
+  });
+
+  scroller?.addEventListener("scroll", () => {
+    const next = Math.round(scroller.scrollLeft / Math.max(1, scroller.clientWidth));
+    if (next !== state.lectureCurrentSpread) state.lectureCurrentSpread = next;
+    if (label) label.textContent = `${state.lectureCurrentSpread + 1} / ${spreads.length}`;
+  }, { passive: true });
+  scroller?.addEventListener("wheel", (event) => {
+    if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return;
+    event.preventDefault();
+    scroller.scrollLeft += event.deltaY;
+  }, { passive: false });
+  mode?.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowRight" || event.key === "PageDown") {
+      event.preventDefault();
+      goToSpread(state.lectureCurrentSpread + 1);
+    } else if (event.key === "ArrowLeft" || event.key === "PageUp") {
+      event.preventDefault();
+      goToSpread(state.lectureCurrentSpread - 1);
+    } else if (event.key === "Escape") {
+      document.querySelector("#exit-lecture")?.click();
+    }
+  });
+  mode?.focus();
+}
+
+function attachLectureEditorListeners(section) {
+  attachThemeListeners();
+  const editor = document.querySelector("#lecture-section-editor");
+  if (!editor) return;
+  if (!lectureSaveDebounced) lectureSaveDebounced = debounce((sectionId) => persistLectureSectionById(sectionId, { quiet: true }), 950);
+
+  const markDirty = () => {
+    section.content_edited = editor.innerHTML;
+    section._editorDirty = true;
+    setLectureSaveState("Modificări nesalvate", "saving");
+    const words = document.querySelector("#lecture-word-count");
+    if (words) words.textContent = `${conceptWordCount(editor.innerHTML)} cuvinte`;
+    lectureSaveDebounced(section.id);
+  };
+
+  editor.addEventListener("input", markDirty);
+  editor.addEventListener("keyup", () => storeLectureEditorSelection(editor));
+  editor.addEventListener("mouseup", () => storeLectureEditorSelection(editor));
+  editor.addEventListener("focus", () => storeLectureEditorSelection(editor));
+  document.querySelectorAll(".lecture-tool").forEach((button) => button.addEventListener("mousedown", (event) => event.preventDefault()));
+  document.querySelectorAll("[data-lecture-command]").forEach((button) => {
+    button.addEventListener("click", () => runLectureEditorCommand(editor, button.dataset.lectureCommand));
+  });
+  document.querySelectorAll("[data-lecture-block]").forEach((button) => {
+    button.addEventListener("click", () => runLectureEditorCommand(editor, "formatBlock", button.dataset.lectureBlock));
+  });
+  document.querySelectorAll("[data-lecture-highlight]").forEach((button) => {
+    button.addEventListener("click", () => applyLectureHighlight(editor, button.dataset.lectureHighlight));
+  });
+  document.querySelector("#clear-lecture-highlight")?.addEventListener("click", () => clearLectureHighlight(editor));
+  document.querySelector("#lecture-add-link")?.addEventListener("click", () => {
+    const url = window.prompt("Introdu adresa linkului (https://… sau mailto:…):", "https://");
+    if (!url) return;
+    if (!/^(https?:|mailto:)/i.test(url.trim())) {
+      toast("Linkul trebuie să înceapă cu https://, http:// sau mailto:.", "error");
+      return;
+    }
+    runLectureEditorCommand(editor, "createLink", url.trim());
+  });
+  document.querySelector("#save-lecture-now")?.addEventListener("click", async () => {
+    section.content_edited = editor.innerHTML;
+    section._editorDirty = true;
+    lectureSaveDebounced.cancel?.();
+    await persistLectureSectionById(section.id);
+  });
+  document.querySelector("#reset-lecture-source")?.addEventListener("click", () => {
+    if (!window.confirm("Înlocuiești această versiune cu traducerea Markdown actuală?")) return;
+    editor.innerHTML = markdownToWikiHtml(section.source_markdown);
+    lectureEditorSelection = null;
+    markDirty();
+    editor.focus();
+  });
+  document.querySelector("#close-lecture-editor")?.addEventListener("click", async () => {
+    await flushCurrentLectureSection();
+    state.lectureEditingSectionId = null;
+    renderEditor();
+  });
+}
+
+
 function renderEditor() {
+  if (state.projectView === "lecture") {
+    renderLectureView();
+    return;
+  }
+  document.body.classList.remove("lecture-active");
   if (state.projectView === "wiki") renderWikiView();
   else if (state.projectView === "chapters") renderKnowledgeView();
   else renderTranslationView();
@@ -3078,6 +3727,9 @@ async function handleAuthenticatedSession(session) {
     state.chunks = [];
     state.chapters = [];
     state.concepts = [];
+    state.lectureSections = [];
+    state.lectureSetupError = null;
+    state.lectureEditingSectionId = null;
     state.projectView = "translation";
     state.selectedConceptId = null;
     state.knowledgeSetupError = null;
@@ -3124,6 +3776,7 @@ async function initializeSupabaseConnection(connection) {
 }
 
 async function start() {
+  applyTheme(state.theme);
   ensureToastRegion();
   const savedConnection = loadSavedConnection();
   if (!savedConnection) {
@@ -3145,12 +3798,20 @@ async function start() {
 window.addEventListener("beforeunload", (event) => {
   saveDebounced?.cancel?.();
   conceptSaveDebounced?.cancel?.();
+  lectureSaveDebounced?.cancel?.();
   const hasDirtyConcept = state.concepts.some((concept) => concept._editorDirty || concept._notesDirty);
-  if (state.ai.running || state.knowledge.running || hasDirtyConcept) {
+  const hasDirtyLecture = state.lectureSections.some((section) => section._editorDirty);
+  if (state.ai.running || state.knowledge.running || hasDirtyConcept || hasDirtyLecture) {
     event.preventDefault();
     event.returnValue = "";
   }
 });
+window.addEventListener("resize", () => {
+  if (state.projectView !== "lecture" || state.lectureEditingSectionId) return;
+  window.clearTimeout(lectureResizeTimer);
+  lectureResizeTimer = window.setTimeout(() => renderEditor(), 180);
+});
+
 window.addEventListener("hashchange", async () => {
   if (!state.session) return;
   const route = parseAppHash();
@@ -3159,7 +3820,7 @@ window.addEventListener("hashchange", async () => {
       await openProject(route.projectId, { view: route.view || "wiki", conceptId: route.conceptId || null });
       return;
     }
-    if (route.view && ["translation", "chapters", "wiki"].includes(route.view)) state.projectView = route.view;
+    if (route.view && ["translation", "chapters", "wiki", "lecture"].includes(route.view)) state.projectView = route.view;
     if (route.conceptId && state.concepts.some((concept) => concept.id === route.conceptId)) {
       state.selectedConceptId = route.conceptId;
       state.wikiFocusConceptId = route.conceptId;
