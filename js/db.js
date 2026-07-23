@@ -234,6 +234,16 @@ export async function getProjectKnowledge(projectId) {
   };
 }
 
+
+export async function saveConceptEditor(conceptId, contentHtml) {
+  const { data, error } = await getSupabase().rpc("save_concept_editor", {
+    p_concept_id: conceptId,
+    p_content_html: contentHtml || "",
+  });
+  if (error) throw error;
+  return Array.isArray(data) ? data[0] : data;
+}
+
 export async function replaceProjectKnowledge(projectId, chapters) {
   const payload = {
     chapters: (chapters ?? []).map((chapter, chapterIndex) => ({

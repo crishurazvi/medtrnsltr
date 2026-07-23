@@ -42,3 +42,32 @@ Publish Directory: ./dist
 ## Limitări de securitate
 
 Cheia DeepSeek nu este salvată în GitHub, Render, Supabase Database sau Storage. Totuși, cât timp fila este deschisă, cheia există în browser și poate fi văzută de codul care rulează pe acel origin, de extensii malițioase sau în Network DevTools. Folosește aplicația numai pe dispozitive de încredere și setează limite de credit în contul DeepSeek.
+
+## Faza 1 — Capitole și concepte
+
+Versiunea aceasta adaugă un al doilea view în interiorul fiecărui proiect:
+
+- **Traducere** — fluxul existent, neschimbat;
+- **Capitole** — arbore navigabil cu capitole și concepte generate de DeepSeek.
+
+Proiectul existent joacă rolul de **curs**. Fiecare concept păstrează referințe către segmentele și paginile din care a fost extras, astfel încât informația generată de AI poate fi verificată în textul tradus și în original.
+
+Înainte de primul deploy al acestei versiuni, rulează o singură dată:
+
+```text
+supabase/phase1_chapters.sql
+```
+
+în Supabase Dashboard → SQL Editor. Nu este necesară nicio modificare a funcției `deepseek-proxy` dacă traducerea automată funcționează deja.
+
+## Faza 2 — Wiki Editor
+
+Faza 2 adaugă un editor rich-text separat pentru fiecare concept din tabul **Capitole**. Conținutul extras este păstrat în `content_original`, iar versiunea utilizatorului este salvată în `content_edited` cu autosave și revizii numerotate.
+
+Pentru instalare, rulează după Faza 1:
+
+```text
+supabase/phase2_concept_editor.sql
+```
+
+Instrucțiunile complete sunt în `FAZA2_EDITOR_GITHUB.md`.

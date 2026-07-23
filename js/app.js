@@ -16,6 +16,7 @@ import {
   onAuthChange,
   replaceProjectKnowledge,
   resetPassword,
+  saveConceptEditor,
   signIn,
   signOut,
   signUp,
@@ -103,6 +104,8 @@ const state = {
 };
 
 let saveDebounced;
+let conceptSaveDebounced;
+let conceptEditorSelection = null;
 let authSubscription;
 
 function ensureToastRegion() {
@@ -159,7 +162,7 @@ function topbar({ editor = false } = {}) {
 function attachTopbarListeners() {
   document.querySelector("#logout")?.addEventListener("click", async () => {
     try {
-      await flushCurrentChunk();
+      await flushActiveEdits();
       clearDeepSeekSession();
       state.deepseek = null;
       await signOut();
@@ -174,7 +177,7 @@ function attachTopbarListeners() {
 
   document.querySelector("#change-supabase")?.addEventListener("click", async () => {
     try {
-      await flushCurrentChunk();
+      await flushActiveEdits();
       clearDeepSeekSession();
       state.deepseek = null;
       await signOut();
@@ -185,7 +188,7 @@ function attachTopbarListeners() {
   });
 
   document.querySelector("#back-dashboard")?.addEventListener("click", async () => {
-    await flushCurrentChunk();
+    await flushActiveEdits();
     state.currentProject = null;
     state.chunks = [];
     state.chapters = [];
@@ -1020,7 +1023,7 @@ async function startAutoTranslation({ indices = null, onlyUntranslated = true, a
     return;
   }
 
-  await flushCurrentChunk();
+  await flushActiveEdits();
 
   const candidateIndices = Array.isArray(indices)
     ? indices.filter((index) => Number.isInteger(index) && state.chunks[index])
@@ -1131,7 +1134,7 @@ function attachProjectViewTabs() {
     button.addEventListener("click", async () => {
       const nextView = button.dataset.projectView;
       if (!nextView || nextView === state.projectView) return;
-      if (state.projectView === "translation") await flushCurrentChunk();
+      await flushActiveEdits();
       state.projectView = nextView;
       if (nextView === "chapters" && !state.selectedConceptId) {
         state.selectedConceptId = state.concepts[0]?.id ?? null;
@@ -1354,7 +1357,7 @@ async function startKnowledgeGeneration() {
   }
 
   if (state.chapters.length && !window.confirm("Regenerarea va înlocui structura actuală de capitole și concepte. Continui?")) return;
-  await flushCurrentChunk();
+  await flushActiveEdits();
 
   const targets = state.chunks.filter((chunk) => chunk.translated_text?.trim() || chunk.source_text?.trim());
   if (!targets.length) {
@@ -1443,6 +1446,219 @@ function selectedKnowledgeConcept() {
   return state.concepts.find((concept) => concept.id === state.selectedConceptId) ?? state.concepts[0] ?? null;
 }
 
+const CONCEPT_EDITOR_ALLOWED_TAGS = new Set([
+  "P", "BR", "H2", "H3", "STRONG", "B", "EM", "I", "U", "S",
+  "UL", "OL", "LI", "BLOCKQUOTE", "A",
+]);
+
+function sanitizeConceptHtml(rawHtml) {
+  const template = document.createElement("template");
+  template.innerHTML = String(rawHtml || "");
+
+  const cleanNode = (node) => {
+    if (node.nodeType === Node.TEXT_NODE) return document.createTextNode(node.textContent || "");
+    if (node.nodeType !== Node.ELEMENT_NODE) return document.createDocumentFragment();
+
+    const sourceTag = node.tagName.toUpperCase();
+    const normalizedTag = sourceTag === "DIV" ? "P" : sourceTag === "H1" ? "H2" : sourceTag;
+    const fragment = document.createDocumentFragment();
+
+    if (!CONCEPT_EDITOR_ALLOWED_TAGS.has(normalizedTag)) {
+      [...node.childNodes].forEach((child) => fragment.appendChild(cleanNode(child)));
+      return fragment;
+    }
+
+    const element = document.createElement(normalizedTag.toLowerCase());
+    if (normalizedTag === "A") {
+      const href = String(node.getAttribute("href") || "").trim();
+      if (/^(https?:|mailto:|#)/i.test(href)) {
+        element.setAttribute("href", href);
+        if (/^https?:/i.test(href)) {
+          element.setAttribute("target", "_blank");
+          element.setAttribute("rel", "noopener noreferrer");
+        }
+      }
+    }
+
+    [...node.childNodes].forEach((child) => element.appendChild(cleanNode(child)));
+    return element;
+  };
+
+  const wrapper = document.createElement("div");
+  [...template.content.childNodes].forEach((node) => wrapper.appendChild(cleanNode(node)));
+  return wrapper.innerHTML.trim();
+}
+
+function plainTextToConceptHtml(value) {
+  const text = String(value || "").replace(/\r\n?/g, "\n").trim();
+  if (!text) return "<p><br></p>";
+
+  const lines = text.split("\n");
+  const output = [];
+  let paragraph = [];
+  let listType = null;
+  let listItems = [];
+
+  const inline = (line) => escapeHtml(line)
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/__(.+?)__/g, "<strong>$1</strong>")
+    .replace(/\*([^*]+?)\*/g, "<em>$1</em>");
+
+  const flushParagraph = () => {
+    if (!paragraph.length) return;
+    output.push(`<p>${paragraph.map(inline).join("<br>")}</p>`);
+    paragraph = [];
+  };
+
+  const flushList = () => {
+    if (!listItems.length || !listType) return;
+    output.push(`<${listType}>${listItems.map((item) => `<li>${inline(item)}</li>`).join("")}</${listType}>`);
+    listType = null;
+    listItems = [];
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.trimEnd();
+    if (!line.trim()) {
+      flushParagraph();
+      flushList();
+      continue;
+    }
+
+    const heading = line.match(/^#{1,3}\s+(.+)$/);
+    const bullet = line.match(/^[-•]\s+(.+)$/);
+    const ordered = line.match(/^\d+[.)]\s+(.+)$/);
+    const quote = line.match(/^>\s?(.+)$/);
+
+    if (heading) {
+      flushParagraph();
+      flushList();
+      output.push(`<${heading[0].startsWith("###") ? "h3" : "h2"}>${inline(heading[1])}</${heading[0].startsWith("###") ? "h3" : "h2"}>`);
+    } else if (bullet || ordered) {
+      flushParagraph();
+      const nextType = bullet ? "ul" : "ol";
+      if (listType && listType !== nextType) flushList();
+      listType = nextType;
+      listItems.push((bullet || ordered)[1]);
+    } else if (quote) {
+      flushParagraph();
+      flushList();
+      output.push(`<blockquote>${inline(quote[1])}</blockquote>`);
+    } else {
+      flushList();
+      paragraph.push(line);
+    }
+  }
+
+  flushParagraph();
+  flushList();
+  return sanitizeConceptHtml(output.join(""));
+}
+
+function conceptOriginalText(concept, sourceChunks = []) {
+  if (concept?.content_original?.trim()) return concept.content_original;
+  const fromChunks = sourceChunks
+    .map((chunk) => chunk.translated_text?.trim() || chunk.source_text?.trim() || "")
+    .filter(Boolean)
+    .join("\n\n");
+  return fromChunks || concept?.summary || "";
+}
+
+function conceptEditorHtml(concept, sourceChunks = []) {
+  if (concept?.content_edited?.trim()) return sanitizeConceptHtml(concept.content_edited);
+  return plainTextToConceptHtml(conceptOriginalText(concept, sourceChunks));
+}
+
+function conceptWordCount(html) {
+  const holder = document.createElement("div");
+  holder.innerHTML = sanitizeConceptHtml(html);
+  const text = holder.textContent?.trim() || "";
+  return text ? text.split(/\s+/).length : 0;
+}
+
+function setConceptSaveState(label, className = "") {
+  const element = document.querySelector("#concept-save-state");
+  if (!element) return;
+  element.textContent = label;
+  element.className = `save-state ${className}`;
+}
+
+function formatConceptEditorTimestamp(value) {
+  if (!value) return "niciodată";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "necunoscut";
+  return date.toLocaleString("ro-RO", {
+    day: "2-digit",
+    month: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+async function persistConceptById(conceptId, { quiet = false } = {}) {
+  const concept = state.concepts.find((item) => item.id === conceptId);
+  if (!concept || !concept._editorDirty) return concept;
+
+  if (concept.id === state.selectedConceptId) setConceptSaveState("Se salvează…", "saving");
+
+  try {
+    const sanitized = sanitizeConceptHtml(concept.content_edited || "");
+    const saved = await saveConceptEditor(concept.id, sanitized);
+    if (!saved) throw new Error("Supabase nu a returnat conceptul salvat.");
+    Object.assign(concept, saved, { _editorDirty: false });
+    if (concept.id === state.selectedConceptId) {
+      setConceptSaveState("Salvat", "saved");
+      const revision = document.querySelector("#concept-revision");
+      const lastSaved = document.querySelector("#concept-last-saved");
+      if (revision) revision.textContent = `revizia ${Number(concept.manual_revision || 0)}`;
+      if (lastSaved) lastSaved.textContent = `ultima salvare: ${formatConceptEditorTimestamp(concept.editor_updated_at)}`;
+    }
+    if (!quiet) toast("Concept salvat.", "success", 1800);
+    return concept;
+  } catch (error) {
+    if (concept.id === state.selectedConceptId) setConceptSaveState("Eroare la salvare", "");
+    toast(error.message || "Nu am putut salva conceptul.", "error");
+    throw error;
+  }
+}
+
+async function flushCurrentConcept() {
+  conceptSaveDebounced?.cancel?.();
+  const dirtyConcepts = state.concepts.filter((concept) => concept._editorDirty);
+  for (const concept of dirtyConcepts) {
+    await persistConceptById(concept.id, { quiet: true });
+  }
+}
+
+async function flushActiveEdits() {
+  await flushCurrentChunk();
+  await flushCurrentConcept();
+}
+
+function storeConceptEditorSelection(editor) {
+  const selection = window.getSelection();
+  if (!selection?.rangeCount) return;
+  const range = selection.getRangeAt(0);
+  if (editor.contains(range.commonAncestorContainer)) conceptEditorSelection = range.cloneRange();
+}
+
+function restoreConceptEditorSelection(editor) {
+  if (!conceptEditorSelection) {
+    editor.focus();
+    return;
+  }
+  const selection = window.getSelection();
+  selection.removeAllRanges();
+  selection.addRange(conceptEditorSelection);
+}
+
+function runConceptEditorCommand(editor, command, value = null) {
+  restoreConceptEditorSelection(editor);
+  document.execCommand(command, false, value);
+  storeConceptEditorSelection(editor);
+  editor.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
 function renderKnowledgeView() {
   const project = state.currentProject;
   if (!project) return;
@@ -1476,8 +1692,8 @@ function renderKnowledgeView() {
     const collapsed = state.collapsedChapters.has(chapter.id);
     const items = concepts.map((concept) => `
       <button class="concept-tree-item ${concept.id === selected?.id ? "active" : ""}" data-concept-id="${concept.id}">
-        <span class="concept-tree-dot"></span>
-        <span><strong>${escapeHtml(concept.title)}</strong><small>${escapeHtml(pagesLabel(concept.page_start, concept.page_end))}</small></span>
+        <span class="concept-tree-dot ${concept.content_edited?.trim() ? "edited" : ""}"></span>
+        <span><strong>${escapeHtml(concept.title)}</strong><small>${escapeHtml(pagesLabel(concept.page_start, concept.page_end))}${concept.content_edited?.trim() ? " · editat" : ""}</small></span>
       </button>`).join("");
     return `<section class="knowledge-tree-chapter">
       <button class="knowledge-chapter-row" data-toggle-chapter="${chapter.id}" aria-expanded="${!collapsed}">
@@ -1495,9 +1711,16 @@ function renderKnowledgeView() {
       .sort((a, b) => a.position - b.position)
     : [];
 
+  const phase2Ready = !selected || Object.prototype.hasOwnProperty.call(selected, "content_edited");
   const setupMessage = state.knowledgeSetupError
-    ? `<div class="error-box"><strong>Schema pentru capitole nu este instalată.</strong><br>Rulează o singură dată fișierul <code>supabase/phase1_chapters.sql</code> în Supabase SQL Editor, apoi reîncarcă pagina.</div>`
-    : "";
+    ? `<div class="error-box"><strong>Schema pentru capitole nu este instalată.</strong><br>Rulează fișierele <code>phase1_chapters.sql</code> și <code>phase2_concept_editor.sql</code> în Supabase SQL Editor, apoi reîncarcă pagina.</div>`
+    : !phase2Ready
+      ? `<div class="error-box"><strong>Editorul Fazei 2 nu este instalat în Supabase.</strong><br>Rulează o singură dată fișierul <code>supabase/phase2_concept_editor.sql</code>, apoi reîncarcă pagina.</div>`
+      : "";
+
+  const editorHtml = selected ? conceptEditorHtml(selected, sourceChunks) : "";
+  const wordCount = selected ? conceptWordCount(editorHtml) : 0;
+  const lastEdited = formatConceptEditorTimestamp(selected?.editor_updated_at);
 
   const conceptContent = selected ? `
     <article class="knowledge-concept-card">
@@ -1510,13 +1733,59 @@ function renderKnowledgeView() {
         <span class="badge primary">${escapeHtml(pagesLabel(selected.page_start, selected.page_end))}</span>
       </div>
       ${(selected.tags || []).length ? `<div class="knowledge-tags">${selected.tags.map((tag) => `<span>${escapeHtml(tag)}</span>`).join("")}</div>` : ""}
-      <div class="knowledge-actions">
-        <button id="open-concept-source" class="btn btn-primary btn-sm" ${sourceChunks.length ? "" : "disabled"}>Deschide primul segment sursă</button>
-        <span class="help">Editarea conceptului, notițele și highlight-urile vor fi adăugate în fazele următoare.</span>
-      </div>
     </article>
+
+    <section class="concept-editor-card">
+      <header class="concept-editor-header">
+        <div>
+          <h3>Editorul conceptului</h3>
+          <p>Versiunea ta este salvată separat de textul extras din PDF.</p>
+        </div>
+        <div class="concept-editor-meta">
+          <span id="concept-word-count">${wordCount} cuvinte</span>
+          <span id="concept-revision">revizia ${Number(selected.manual_revision || 0)}</span>
+          <span id="concept-last-saved">ultima salvare: ${escapeHtml(lastEdited)}</span>
+          <span id="concept-save-state" class="save-state saved">Salvat</span>
+        </div>
+      </header>
+
+      <div class="concept-toolbar" role="toolbar" aria-label="Formatarea conceptului">
+        <button type="button" class="editor-tool" data-editor-command="undo" title="Undo">↶</button>
+        <button type="button" class="editor-tool" data-editor-command="redo" title="Redo">↷</button>
+        <span class="toolbar-separator"></span>
+        <button type="button" class="editor-tool text-tool" data-editor-block="p">Text</button>
+        <button type="button" class="editor-tool text-tool" data-editor-block="h2">Titlu</button>
+        <button type="button" class="editor-tool text-tool" data-editor-block="h3">Subtitlu</button>
+        <span class="toolbar-separator"></span>
+        <button type="button" class="editor-tool" data-editor-command="bold" title="Bold"><strong>B</strong></button>
+        <button type="button" class="editor-tool" data-editor-command="italic" title="Italic"><em>I</em></button>
+        <button type="button" class="editor-tool" data-editor-command="underline" title="Subliniat"><u>U</u></button>
+        <button type="button" class="editor-tool" data-editor-command="strikeThrough" title="Tăiat"><s>S</s></button>
+        <span class="toolbar-separator"></span>
+        <button type="button" class="editor-tool" data-editor-command="insertUnorderedList" title="Listă cu puncte">• Listă</button>
+        <button type="button" class="editor-tool" data-editor-command="insertOrderedList" title="Listă numerotată">1. Listă</button>
+        <button type="button" class="editor-tool" data-editor-block="blockquote" title="Citat">❝</button>
+        <button type="button" class="editor-tool" id="concept-add-link" title="Adaugă link">🔗</button>
+        <button type="button" class="editor-tool" data-editor-command="unlink" title="Elimină linkul">⛓</button>
+        <button type="button" class="editor-tool" data-editor-command="removeFormat" title="Șterge formatarea">Tx</button>
+      </div>
+
+      <div id="concept-editor" class="concept-rich-editor ${phase2Ready ? "" : "disabled"}" contenteditable="${phase2Ready ? "true" : "false"}" spellcheck="true" data-placeholder="Scrie și structurează aici conceptul…">${editorHtml}</div>
+
+      <footer class="concept-editor-footer">
+        <div class="help">Autosave după aproximativ o secundă. HTML-ul este curățat înainte de salvare.</div>
+        <div class="concept-editor-actions">
+          <button id="copy-concept-text" class="btn btn-ghost btn-sm" type="button">Copiază textul</button>
+          <button id="reset-concept-content" class="btn btn-ghost btn-sm" type="button" ${phase2Ready ? "" : "disabled"}>Revino la textul sursă</button>
+          <button id="save-concept-now" class="btn btn-primary btn-sm" type="button" ${phase2Ready ? "" : "disabled"}>Salvează acum</button>
+        </div>
+      </footer>
+    </section>
+
     <section class="knowledge-sources">
-      <div class="section-head compact"><div><h3>Fragmente asociate</h3><p>${sourceChunks.length} segmente legate de acest concept.</p></div></div>
+      <div class="section-head compact"><div><h3>Fragmente asociate</h3><p>${sourceChunks.length} segmente legate de acest concept.</p></div>
+        <button id="open-concept-source" class="btn btn-ghost btn-sm" ${sourceChunks.length ? "" : "disabled"}>Deschide primul segment sursă</button>
+      </div>
       ${sourceChunks.map((chunk) => `
         <article class="knowledge-source-card">
           <header>
@@ -1531,8 +1800,8 @@ function renderKnowledgeView() {
     </section>` : `
       <div class="empty-state knowledge-empty">
         ${setupMessage}
-        <h3>${state.knowledgeSetupError ? "Activează schema pentru Faza 1" : state.chapters.length ? "Nu există concepte în această selecție" : "Construiește structura cursului"}</h3>
-        <p>${state.knowledgeSetupError ? "Traducerea existentă continuă să funcționeze; trebuie doar adăugate tabelele chapters și concepts în proiectul Supabase." : state.chapters.length ? "Schimbă termenul de căutare sau regenerează structura." : "DeepSeek va analiza segmentele pe rând și va crea o navigare pe capitole și concepte, păstrând legătura cu paginile și segmentele sursă."}</p>
+        <h3>${state.knowledgeSetupError ? "Activează schema pentru Faza 1 și Faza 2" : state.chapters.length ? "Nu există concepte în această selecție" : "Construiește structura cursului"}</h3>
+        <p>${state.knowledgeSetupError ? "Traducerea existentă continuă să funcționeze; trebuie adăugate tabelele pentru capitole și coloanele editorului." : state.chapters.length ? "Schimbă termenul de căutare sau regenerează structura." : "DeepSeek va analiza segmentele pe rând și va crea o navigare pe capitole și concepte."}</p>
         <button id="generate-knowledge-empty" class="btn btn-accent" ${state.knowledgeSetupError ? "disabled" : ""}>✦ Generează capitolele cu DeepSeek</button>
       </div>`;
 
@@ -1544,24 +1813,22 @@ function renderKnowledgeView() {
           <div>
             <div class="editor-title-line">
               <h1>${escapeHtml(project.title)}</h1>
-              <span class="badge primary">Faza 1 · Knowledge View</span>
+              <span class="badge primary">Faza 2 · Wiki Editor</span>
             </div>
-            <div class="editor-subtitle">${state.chapters.length} capitole · ${state.concepts.length} concepte · structură generată din segmentele proiectului</div>
+            <div class="editor-subtitle">${state.chapters.length} capitole · ${state.concepts.length} concepte · editor individual cu autosave</div>
           </div>
           <div class="editor-actions">
             <button id="generate-knowledge" class="btn btn-accent btn-sm" ${state.knowledge.running || state.ai.running || state.knowledgeSetupError ? "disabled" : ""}>✦ ${state.chapters.length ? "Regenerează structura" : "Generează structura"}</button>
-            <button id="project-settings" class="btn btn-ghost btn-sm">Setări proiect</button>
-            <button id="export-project" class="btn btn-primary btn-sm">Exportă</button>
+            <button id="project-settings" class="btn btn-ghost btn-sm">Setări</button>
+            <button id="export-project" class="btn btn-ghost btn-sm">Exportă</button>
           </div>
         </section>
-
         ${projectViewTabs()}
-
+        ${setupMessage && selected ? setupMessage : ""}
         <section class="knowledge-layout">
           <aside class="knowledge-sidebar">
-            <div class="sidebar-head">
+            <div class="sidebar-search">
               <input id="knowledge-search" class="input" value="${escapeHtml(state.knowledgeSearch)}" placeholder="Caută capitole sau concepte…" />
-              <span class="help">${visibleChapters.length} capitole afișate</span>
             </div>
             <div class="knowledge-tree">${tree || '<div class="help" style="padding:16px">Nu există rezultate.</div>'}</div>
           </aside>
@@ -1572,18 +1839,20 @@ function renderKnowledgeView() {
 
   attachTopbarListeners();
   attachProjectViewTabs();
-  attachKnowledgeListeners(sourceChunks);
-}
-
-function attachKnowledgeListeners(sourceChunks = []) {
-  document.querySelector("#generate-knowledge")?.addEventListener("click", startKnowledgeGeneration);
-  document.querySelector("#generate-knowledge-empty")?.addEventListener("click", startKnowledgeGeneration);
   document.querySelector("#project-settings")?.addEventListener("click", showProjectSettingsModal);
   document.querySelector("#export-project")?.addEventListener("click", showExportModal);
+  document.querySelector("#generate-knowledge")?.addEventListener("click", startKnowledgeGeneration);
+  document.querySelector("#generate-knowledge-empty")?.addEventListener("click", startKnowledgeGeneration);
+
+  if (!conceptSaveDebounced) {
+    conceptSaveDebounced = debounce((conceptId) => persistConceptById(conceptId, { quiet: true }), 950);
+  }
 
   document.querySelectorAll("[data-concept-id]").forEach((button) => {
-    button.addEventListener("click", () => {
+    button.addEventListener("click", async () => {
+      await flushCurrentConcept();
       state.selectedConceptId = button.dataset.conceptId;
+      conceptEditorSelection = null;
       renderEditor();
     });
   });
@@ -1606,9 +1875,73 @@ function attachKnowledgeListeners(sourceChunks = []) {
     input?.setSelectionRange(caret, caret);
   });
 
-  document.querySelector("#open-concept-source")?.addEventListener("click", () => {
+  const editor = document.querySelector("#concept-editor");
+  if (editor && selected && phase2Ready) {
+    const markDirty = () => {
+      selected.content_edited = editor.innerHTML;
+      selected._editorDirty = true;
+      setConceptSaveState("Modificări nesalvate", "saving");
+      const words = document.querySelector("#concept-word-count");
+      if (words) words.textContent = `${conceptWordCount(editor.innerHTML)} cuvinte`;
+      conceptSaveDebounced(selected.id);
+    };
+
+    editor.addEventListener("input", markDirty);
+    editor.addEventListener("keyup", () => storeConceptEditorSelection(editor));
+    editor.addEventListener("mouseup", () => storeConceptEditorSelection(editor));
+    editor.addEventListener("focus", () => storeConceptEditorSelection(editor));
+
+    document.querySelectorAll(".editor-tool").forEach((button) => {
+      button.addEventListener("mousedown", (event) => event.preventDefault());
+    });
+
+    document.querySelectorAll("[data-editor-command]").forEach((button) => {
+      button.addEventListener("click", () => runConceptEditorCommand(editor, button.dataset.editorCommand));
+    });
+
+    document.querySelectorAll("[data-editor-block]").forEach((button) => {
+      button.addEventListener("click", () => runConceptEditorCommand(editor, "formatBlock", button.dataset.editorBlock));
+    });
+
+    document.querySelector("#concept-add-link")?.addEventListener("click", () => {
+      const url = window.prompt("Introdu adresa linkului (https://… sau mailto:…):", "https://");
+      if (!url) return;
+      if (!/^(https?:|mailto:)/i.test(url.trim())) {
+        toast("Linkul trebuie să înceapă cu https://, http:// sau mailto:.", "error");
+        return;
+      }
+      runConceptEditorCommand(editor, "createLink", url.trim());
+    });
+
+    document.querySelector("#save-concept-now")?.addEventListener("click", async () => {
+      selected.content_edited = editor.innerHTML;
+      selected._editorDirty = true;
+      conceptSaveDebounced.cancel?.();
+      await persistConceptById(selected.id);
+    });
+
+    document.querySelector("#reset-concept-content")?.addEventListener("click", () => {
+      if (!window.confirm("Înlocuiești versiunea editată cu textul extras din fragmentele sursă?")) return;
+      editor.innerHTML = plainTextToConceptHtml(conceptOriginalText(selected, sourceChunks));
+      conceptEditorSelection = null;
+      markDirty();
+      editor.focus();
+    });
+
+    document.querySelector("#copy-concept-text")?.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(editor.innerText || "");
+        toast("Textul conceptului a fost copiat.", "success", 1800);
+      } catch {
+        toast("Browserul nu a permis accesul la clipboard.", "error");
+      }
+    });
+  }
+
+  document.querySelector("#open-concept-source")?.addEventListener("click", async () => {
     const firstChunk = sourceChunks[0];
     if (!firstChunk) return;
+    await flushCurrentConcept();
     state.currentIndex = firstChunk.position;
     state.projectView = "translation";
     renderEditor();
@@ -1762,7 +2095,7 @@ async function flushCurrentChunk() {
 
 async function goToChunk(index) {
   if (index < 0 || index >= state.chunks.length) return;
-  await flushCurrentChunk();
+  await flushActiveEdits();
   state.currentIndex = index;
   renderEditor();
 }
@@ -2009,7 +2342,9 @@ async function start() {
 
 window.addEventListener("beforeunload", (event) => {
   saveDebounced?.cancel?.();
-  if (state.ai.running) {
+  conceptSaveDebounced?.cancel?.();
+  const hasDirtyConcept = state.concepts.some((concept) => concept._editorDirty);
+  if (state.ai.running || state.knowledge.running || hasDirtyConcept) {
     event.preventDefault();
     event.returnValue = "";
   }
@@ -2019,7 +2354,7 @@ window.addEventListener("hashchange", async () => {
   const match = window.location.hash.match(/^#project=([a-f0-9-]+)$/i);
   if (match && state.currentProject?.id !== match[1]) await openProject(match[1]);
   if (!match && state.currentProject) {
-    await flushCurrentChunk();
+    await flushActiveEdits();
     state.currentProject = null;
     await loadDashboard();
   }
