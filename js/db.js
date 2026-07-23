@@ -191,6 +191,33 @@ export async function listProjects() {
   });
 }
 
+export async function listLibraryKnowledge() {
+  const [chaptersResult, conceptsResult] = await Promise.all([
+    getSupabase()
+      .from("chapters")
+      .select("id, project_id, title, summary, position, page_start, page_end")
+      .order("project_id", { ascending: true })
+      .order("position", { ascending: true }),
+    getSupabase()
+      .from("concepts")
+      .select(`
+        id, project_id, chapter_id, title, summary, position, page_start, page_end,
+        tags, source_chunk_ids, content_original, content_edited, editor_updated_at,
+        manual_revision, personal_notes, notes_updated_at, notes_revision
+      `)
+      .order("project_id", { ascending: true })
+      .order("position", { ascending: true }),
+  ]);
+
+  if (chaptersResult.error) throw chaptersResult.error;
+  if (conceptsResult.error) throw conceptsResult.error;
+
+  return {
+    chapters: chaptersResult.data ?? [],
+    concepts: conceptsResult.data ?? [],
+  };
+}
+
 export async function getProject(projectId) {
   const { data, error } = await getSupabase()
     .from("projects")

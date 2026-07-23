@@ -12,6 +12,7 @@ import {
   initSupabase,
   invokeDeepSeekTranslation,
   listGlossary,
+  listLibraryKnowledge,
   listProjects,
   onAuthChange,
   replaceProjectKnowledge,
@@ -71,6 +72,10 @@ const state = {
   connection: loadSavedConnection(),
   projects: [],
   glossary: [],
+  dashboardView: "library",
+  librarySearch: "",
+  libraryKnowledge: { chapters: [], concepts: [] },
+  librarySetupError: null,
   currentProject: null,
   chunks: [],
   currentIndex: 0,
@@ -82,6 +87,11 @@ const state = {
   selectedConceptId: null,
   collapsedChapters: new Set(),
   knowledgeSetupError: null,
+  wikiSearch: "",
+  wikiShowNotes: true,
+  wikiCollapsedChapters: new Set(),
+  wikiCollapsedConcepts: new Set(),
+  wikiFocusConceptId: null,
   knowledge: {
     running: false,
     stopRequested: false,
@@ -154,7 +164,7 @@ function topbar({ editor = false } = {}) {
         <span>${escapeHtml(APP_CONFIG.appName)}</span>
       </div>
       <div class="top-actions">
-        ${editor ? '<button id="back-dashboard" class="btn btn-ghost btn-sm">← Proiecte</button>' : ""}
+        ${editor ? '<button id="back-dashboard" class="btn btn-ghost btn-sm">← Bibliotecă</button>' : ""}
         <button id="change-deepseek" class="btn btn-ghost btn-sm" title="Cheia este păstrată numai până închizi fila">✦ ${escapeHtml(deepseekLabel)}</button>
         <button id="change-supabase" class="btn btn-ghost btn-sm" title="Schimbă proiectul Supabase">◉ ${escapeHtml(supabaseHost)}</button>
         <span class="user-pill">${escapeHtml(email)}</span>
@@ -198,8 +208,12 @@ function attachTopbarListeners() {
     state.concepts = [];
     state.projectView = "translation";
     state.selectedConceptId = null;
+    state.libraryKnowledge = { chapters: [], concepts: [] };
+    state.librarySetupError = null;
     state.knowledgeSetupError = null;
-    window.location.hash = "";
+    state.wikiSearch = "";
+    state.wikiFocusConceptId = null;
+    window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
     await loadDashboard();
   });
 }
@@ -532,11 +546,22 @@ function showUpdatePasswordModal() {
 }
 
 async function loadDashboard() {
-  app.innerHTML = `${topbar()}<main class="container"><div class="empty-state"><span class="loader loader-dark"></span> Se încarcă proiectele…</div></main>`;
+  app.innerHTML = `${topbar()}<main class="container"><div class="empty-state"><span class="loader loader-dark"></span> Se încarcă biblioteca…</div></main>`;
   attachTopbarListeners();
 
   try {
-    [state.projects, state.glossary] = await Promise.all([listProjects(), listGlossary()]);
+    const [projects, glossary, libraryKnowledge] = await Promise.all([
+      listProjects(),
+      listGlossary(),
+      listLibraryKnowledge().catch((error) => ({ chapters: [], concepts: [], setupError: error })),
+    ]);
+    state.projects = projects;
+    state.glossary = glossary;
+    state.libraryKnowledge = {
+      chapters: libraryKnowledge.chapters ?? [],
+      concepts: libraryKnowledge.concepts ?? [],
+    };
+    state.librarySetupError = libraryKnowledge.setupError || null;
     renderDashboard();
   } catch (error) {
     app.innerHTML = `${topbar()}<main class="container"><div class="error-box">${escapeHtml(error.message)}</div></main>`;
@@ -544,50 +569,180 @@ async function loadDashboard() {
   }
 }
 
+function stripHtmlText(value) {
+  const holder = document.createElement("div");
+  holder.innerHTML = String(value || "");
+  return holder.textContent?.replace(/\s+/g, " ").trim() || "";
+}
+
+function libraryDataForProject(projectId) {
+  const chapters = state.libraryKnowledge.chapters
+    .filter((chapter) => chapter.project_id === projectId)
+    .sort((a, b) => a.position - b.position);
+  const concepts = state.libraryKnowledge.concepts
+    .filter((concept) => concept.project_id === projectId)
+    .sort((a, b) => a.position - b.position);
+  return { chapters, concepts };
+}
+
+function librarySearchText(project, chapters, concepts) {
+  return [
+    project.title,
+    project.source_filename,
+    ...chapters.flatMap((chapter) => [chapter.title, chapter.summary]),
+    ...concepts.flatMap((concept) => [
+      concept.title,
+      concept.summary,
+      ...(concept.tags || []),
+      stripHtmlText(concept.content_edited),
+      concept.content_original,
+      stripHtmlText(concept.personal_notes),
+    ]),
+    ...(project.chunks || []).map((chunk) => chunk.translated_text || ""),
+  ].join(" ").toLocaleLowerCase("ro");
+}
+
+function renderDashboardTabs() {
+  return `<nav class="dashboard-tabs" aria-label="Modul bibliotecii">
+    <button class="dashboard-tab ${state.dashboardView === "library" ? "active" : ""}" data-dashboard-view="library">
+      <span>📚 Bibliotecă Wiki</span><small>Citește și caută în toate cursurile</small>
+    </button>
+    <button class="dashboard-tab ${state.dashboardView === "projects" ? "active" : ""}" data-dashboard-view="projects">
+      <span>🛠 Proiecte</span><small>Import, traducere și administrare</small>
+    </button>
+  </nav>`;
+}
+
+function renderProjectManagementCards() {
+  if (!state.projects.length) {
+    return `<div class="empty-state" style="grid-column:1/-1">
+      <h3>Nu ai încă proiecte</h3>
+      <p>Încarcă primul PDF, extrage textul local și lasă DeepSeek să traducă automat toate segmentele.</p>
+      <button id="empty-create" class="btn btn-primary">Creează primul proiect</button>
+    </div>`;
+  }
+
+  return state.projects.map((project) => {
+    const progress = percentage(project.translatedCount, project.chunkCount);
+    const { chapters, concepts } = libraryDataForProject(project.id);
+    return `<article class="project-card">
+      <h3 class="project-title">${escapeHtml(project.title)}</h3>
+      <div class="project-meta">
+        <span>${escapeHtml(project.source_filename || "PDF")}</span><span>•</span>
+        <span>${project.page_count || "?"} pagini</span><span>•</span>
+        <span>${project.chunkCount} segmente</span>
+      </div>
+      <div class="progress-track"><div class="progress-bar" style="width:${progress}%"></div></div>
+      <div class="project-footer">
+        <small>${project.translatedCount}/${project.chunkCount} traduse · ${chapters.length} capitole · ${concepts.length} concepte</small>
+        <div class="project-card-actions">
+          <button class="btn btn-ghost btn-sm open-wiki" data-id="${project.id}">Wiki</button>
+          <button class="btn btn-primary btn-sm open-project" data-id="${project.id}">Editor</button>
+          <button class="btn btn-danger btn-sm delete-project" data-id="${project.id}" title="Șterge proiectul">Șterge</button>
+        </div>
+      </div>
+      <div class="help" style="margin-top:9px">Actualizat ${escapeHtml(formatDateShort(project.updated_at))}</div>
+    </article>`;
+  }).join("");
+}
+
+function renderLibraryCards() {
+  const query = state.librarySearch.toLocaleLowerCase("ro").trim();
+  const projects = state.projects.filter((project) => {
+    const data = libraryDataForProject(project.id);
+    return !query || librarySearchText(project, data.chapters, data.concepts).includes(query);
+  });
+
+  if (!projects.length) {
+    return `<div class="empty-state library-empty">
+      <h3>${state.projects.length ? "Nu am găsit nimic" : "Biblioteca este goală"}</h3>
+      <p>${state.projects.length ? "Încearcă alt termen: titlu, concept, tag sau text din traducere." : "Creează un proiect, traduce-l și generează capitolele pentru a-l transforma într-o pagină Wiki."}</p>
+      ${state.projects.length ? "" : '<button id="empty-create" class="btn btn-primary">Creează primul proiect</button>'}
+    </div>`;
+  }
+
+  return projects.map((project) => {
+    const { chapters, concepts } = libraryDataForProject(project.id);
+    const matchingConcepts = query
+      ? concepts.filter((concept) => [
+        concept.title,
+        concept.summary,
+        ...(concept.tags || []),
+        stripHtmlText(concept.content_edited),
+        concept.content_original,
+        stripHtmlText(concept.personal_notes),
+      ].join(" ").toLocaleLowerCase("ro").includes(query)).slice(0, 6)
+      : concepts.slice(0, 4);
+    const projectSnippet = chapters[0]?.summary || concepts[0]?.summary || "Document tradus, pregătit pentru organizare și studiu în format Wiki.";
+    const progress = percentage(project.translatedCount, project.chunkCount);
+
+    return `<article class="library-card">
+      <div class="library-card-cover"><span>${escapeHtml((project.title || "M").trim().charAt(0).toUpperCase())}</span></div>
+      <div class="library-card-body">
+        <div class="library-card-kicker">${chapters.length} capitole · ${concepts.length} concepte · ${progress}% tradus</div>
+        <h3>${escapeHtml(project.title)}</h3>
+        <p>${escapeHtml(projectSnippet.slice(0, 260))}</p>
+        ${matchingConcepts.length ? `<div class="library-concept-links">${matchingConcepts.map((concept) => `
+          <button class="library-concept-link" data-open-wiki="${project.id}" data-concept-id="${concept.id}">
+            <strong>${escapeHtml(concept.title)}</strong>
+            <small>${escapeHtml((concept.summary || "Deschide conceptul").slice(0, 115))}</small>
+          </button>`).join("")}</div>` : '<div class="help">Generează structura de capitole pentru navigare semantică.</div>'}
+        <div class="library-card-footer">
+          <span>Actualizat ${escapeHtml(formatDateShort(project.updated_at))}</span>
+          <div>
+            <button class="btn btn-ghost btn-sm open-project" data-id="${project.id}">Editor</button>
+            <button class="btn btn-primary btn-sm open-wiki" data-id="${project.id}">Citește în Wiki →</button>
+          </div>
+        </div>
+      </div>
+    </article>`;
+  }).join("");
+}
+
 function renderDashboard() {
   const totalChunks = state.projects.reduce((sum, project) => sum + project.chunkCount, 0);
   const translatedChunks = state.projects.reduce((sum, project) => sum + project.translatedCount, 0);
-  const approvedChunks = state.projects.reduce((sum, project) => sum + project.approvedCount, 0);
+  const totalConcepts = state.libraryKnowledge.concepts.length;
+  const phaseMessage = state.librarySetupError
+    ? '<div class="warning-box">Biblioteca Wiki necesită schema Fazelor 1–3. Traducerea și proiectele continuă să funcționeze.</div>'
+    : "";
 
-  const projectCards = state.projects.length
-    ? state.projects.map((project) => {
-      const progress = percentage(project.translatedCount, project.chunkCount);
-      return `
-        <article class="project-card">
-          <h3 class="project-title">${escapeHtml(project.title)}</h3>
-          <div class="project-meta">
-            <span>${escapeHtml(project.source_filename || "PDF")}</span>
-            <span>•</span>
-            <span>${project.page_count || "?"} pagini</span>
-            <span>•</span>
-            <span>${project.chunkCount} segmente</span>
-          </div>
-          <div class="progress-track"><div class="progress-bar" style="width:${progress}%"></div></div>
-          <div class="project-footer">
-            <small>${project.translatedCount}/${project.chunkCount} traduse · ${project.approvedCount} aprobate</small>
-            <div style="display:flex;gap:7px">
-              <button class="btn btn-primary btn-sm open-project" data-id="${project.id}">Deschide</button>
-              <button class="btn btn-danger btn-sm delete-project" data-id="${project.id}" title="Șterge proiectul">Șterge</button>
-            </div>
-          </div>
-          <div class="help" style="margin-top:9px">Actualizat ${escapeHtml(formatDateShort(project.updated_at))}</div>
-        </article>`;
-    }).join("")
-    : `<div class="empty-state" style="grid-column:1/-1">
-        <h3>Nu ai încă proiecte</h3>
-        <p>Încarcă primul PDF, extrage textul local și lasă DeepSeek să traducă automat toate segmentele.</p>
-        <button id="empty-create" class="btn btn-primary">Creează primul proiect</button>
-      </div>`;
+  app.innerHTML = `<div class="app-shell">
+    ${topbar()}
+    <main class="container library-container">
+      <section class="library-hero">
+        <div>
+          <span class="library-eyebrow">MedTranslate Personal Wiki</span>
+          <h1>Biblioteca ta medicală, construită din traduceri.</h1>
+          <p>Caută în toate cursurile, citește proiectele ca pagini Wiki și revino oricând în editor pentru a păstra propriile formatări, sublinieri și highlights.</p>
+        </div>
+        <div class="library-metrics">
+          <div><strong>${state.projects.length}</strong><span>cursuri și proiecte</span></div>
+          <div><strong>${totalConcepts}</strong><span>concepte indexate</span></div>
+          <div><strong>${translatedChunks}/${totalChunks}</strong><span>segmente traduse</span></div>
+        </div>
+      </section>
 
-  app.innerHTML = `
-    <div class="app-shell">
-      ${topbar()}
-      <main class="container">
-        <section class="hero">
+      ${renderDashboardTabs()}
+      ${phaseMessage}
+
+      ${state.dashboardView === "library" ? `
+        <section class="library-toolbar">
+          <div>
+            <h2>Toată biblioteca</h2>
+            <p>Rezultatele includ titluri, rezumate, tag-uri, conținut editat, notițe și traduceri.</p>
+          </div>
+          <div class="library-search-wrap">
+            <span>⌕</span>
+            <input id="library-search" class="input" value="${escapeHtml(state.librarySearch)}" placeholder="Caută în întreaga bibliotecă…" />
+          </div>
+        </section>
+        <section class="library-grid">${renderLibraryCards()}</section>` : `
+        <section class="hero compact-hero">
           <div class="hero-main">
-            <h1>Traduceri medicale automate, cu progres salvat.</h1>
-            <p>PDF-ul este împărțit local în segmente, DeepSeek le traduce secvențial, iar fiecare rezultat este salvat imediat în Supabase.</p>
-            <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:20px">
+            <h1>Administrarea proiectelor</h1>
+            <p>Importă PDF-uri, traduce segmentele și construiește structura de capitole și concepte.</p>
+            <div class="dashboard-actions">
               <button id="create-project" class="btn btn-primary">＋ Proiect nou</button>
               <button id="import-backup" class="btn btn-ghost">Importă backup JSON</button>
               <button id="manage-glossary" class="btn btn-ghost">Glosar (${state.glossary.length})</button>
@@ -596,27 +751,45 @@ function renderDashboard() {
           <div class="hero-card">
             <div class="metric"><span>Proiecte</span><strong>${state.projects.length}</strong></div>
             <div class="metric"><span>Segmente traduse</span><strong>${translatedChunks}/${totalChunks}</strong></div>
-            <div class="metric"><span>Segmente aprobate</span><strong>${approvedChunks}</strong></div>
+            <div class="metric"><span>Concepte</span><strong>${totalConcepts}</strong></div>
           </div>
         </section>
-
-        <div class="section-head">
-          <div><h2>Proiectele tale</h2><p>Fiecare proiect este vizibil numai contului care l-a creat.</p></div>
-        </div>
-        <section class="projects-grid">${projectCards}</section>
-      </main>
-    </div>`;
+        <section class="projects-grid">${renderProjectManagementCards()}</section>`}
+    </main>
+  </div>`;
 
   attachTopbarListeners();
+  document.querySelectorAll("[data-dashboard-view]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.dashboardView = button.dataset.dashboardView;
+      renderDashboard();
+    });
+  });
+  document.querySelector("#library-search")?.addEventListener("input", (event) => {
+    state.librarySearch = event.target.value;
+    const caret = event.target.selectionStart;
+    renderDashboard();
+    const input = document.querySelector("#library-search");
+    input?.focus();
+    input?.setSelectionRange(caret, caret);
+  });
   document.querySelector("#create-project")?.addEventListener("click", showCreateProjectModal);
   document.querySelector("#empty-create")?.addEventListener("click", showCreateProjectModal);
   document.querySelector("#manage-glossary")?.addEventListener("click", showGlossaryModal);
   document.querySelector("#import-backup")?.addEventListener("click", triggerBackupImport);
 
   document.querySelectorAll(".open-project").forEach((button) => {
-    button.addEventListener("click", () => openProject(button.dataset.id));
+    button.addEventListener("click", () => openProject(button.dataset.id, { view: "translation" }));
   });
-
+  document.querySelectorAll(".open-wiki").forEach((button) => {
+    button.addEventListener("click", () => openProject(button.dataset.id, { view: "wiki" }));
+  });
+  document.querySelectorAll("[data-open-wiki]").forEach((button) => {
+    button.addEventListener("click", () => openProject(button.dataset.openWiki, {
+      view: "wiki",
+      conceptId: button.dataset.conceptId || null,
+    }));
+  });
   document.querySelectorAll(".delete-project").forEach((button) => {
     button.addEventListener("click", () => confirmDeleteProject(button.dataset.id));
   });
@@ -847,7 +1020,27 @@ async function confirmDeleteProject(projectId) {
   });
 }
 
-async function openProject(projectId) {
+function parseAppHash() {
+  const params = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+  return {
+    projectId: params.get("project"),
+    view: params.get("view"),
+    conceptId: params.get("concept"),
+  };
+}
+
+function syncProjectHash() {
+  if (!state.currentProject) return;
+  const params = new URLSearchParams();
+  params.set("project", state.currentProject.id);
+  params.set("view", state.projectView || "translation");
+  if (state.selectedConceptId && ["chapters", "wiki"].includes(state.projectView)) {
+    params.set("concept", state.selectedConceptId);
+  }
+  window.history.replaceState(null, "", `#${params.toString()}`);
+}
+
+async function openProject(projectId, { view = "translation", conceptId = null } = {}) {
   app.innerHTML = `${topbar({ editor: true })}<main class="container-wide"><div class="empty-state"><span class="loader loader-dark"></span> Se încarcă proiectul…</div></main>`;
   attachTopbarListeners();
 
@@ -868,10 +1061,16 @@ async function openProject(projectId) {
     if (state.currentIndex < 0) state.currentIndex = 0;
     state.chunkSearch = "";
     state.knowledgeSearch = "";
-    state.projectView = "translation";
-    state.selectedConceptId = state.concepts[0]?.id ?? null;
+    state.wikiSearch = "";
+    state.projectView = ["translation", "chapters", "wiki"].includes(view) ? view : "translation";
+    state.selectedConceptId = state.concepts.some((concept) => concept.id === conceptId)
+      ? conceptId
+      : state.concepts[0]?.id ?? null;
+    state.wikiFocusConceptId = conceptId || null;
     state.collapsedChapters = new Set();
-    window.location.hash = `project=${projectId}`;
+    state.wikiCollapsedChapters = new Set();
+    state.wikiCollapsedConcepts = new Set();
+    syncProjectHash();
     renderEditor();
   } catch (error) {
     toast(error.message || "Nu am putut deschide proiectul.", "error");
@@ -1123,11 +1322,14 @@ REGULI:
 function projectViewTabs() {
   const translatedCount = state.chunks.filter((item) => item.translated_text?.trim()).length;
   return `<nav class="project-tabs" aria-label="Vizualizarea proiectului">
+    <button class="project-tab ${state.projectView === "wiki" ? "active" : ""}" data-project-view="wiki">
+      <span>📖 Wiki</span><small>lectură continuă · ${state.chapters.length} capitole</small>
+    </button>
     <button class="project-tab ${state.projectView === "translation" ? "active" : ""}" data-project-view="translation">
-      <span>Traducere</span><small>${translatedCount}/${state.chunks.length}</small>
+      <span>Traducere</span><small>${translatedCount}/${state.chunks.length} segmente</small>
     </button>
     <button class="project-tab ${state.projectView === "chapters" ? "active" : ""}" data-project-view="chapters">
-      <span>Capitole</span><small>${state.chapters.length} capitole · ${state.concepts.length} concepte</small>
+      <span>Concepte & editare</span><small>${state.chapters.length} capitole · ${state.concepts.length} concepte</small>
     </button>
   </nav>`;
 }
@@ -1139,9 +1341,10 @@ function attachProjectViewTabs() {
       if (!nextView || nextView === state.projectView) return;
       await flushActiveEdits();
       state.projectView = nextView;
-      if (nextView === "chapters" && !state.selectedConceptId) {
+      if (["chapters", "wiki"].includes(nextView) && !state.selectedConceptId) {
         state.selectedConceptId = state.concepts[0]?.id ?? null;
       }
+      syncProjectHash();
       renderEditor();
     });
   });
@@ -1450,8 +1653,10 @@ function selectedKnowledgeConcept() {
 }
 
 const CONCEPT_EDITOR_ALLOWED_TAGS = new Set([
-  "P", "BR", "H2", "H3", "STRONG", "B", "EM", "I", "U", "S",
-  "UL", "OL", "LI", "BLOCKQUOTE", "A", "MARK",
+  "P", "BR", "H2", "H3", "H4", "H5", "H6", "STRONG", "B", "EM", "I", "U", "S",
+  "UL", "OL", "LI", "BLOCKQUOTE", "A", "MARK", "HR",
+  "TABLE", "THEAD", "TBODY", "TFOOT", "TR", "TH", "TD", "PRE", "CODE",
+  "SUP", "SUB",
 ]);
 
 const CONCEPT_HIGHLIGHT_TYPES = new Set(["important", "definition", "example", "review"]);
@@ -1503,7 +1708,18 @@ function sanitizeConceptHtml(rawHtml) {
   return wrapper.innerHTML.trim();
 }
 
-function plainTextToConceptHtml(value) {
+function renderInlineMarkdown(value) {
+  return escapeHtml(String(value || ""))
+    .replace(/`([^`]+?)`/g, "<code>$1</code>")
+    .replace(/\[([^\]]+?)\]\(((?:https?:\/\/|mailto:)[^)\s]+)\)/g, '<a href="$2">$1</a>')
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/__(.+?)__/g, "<strong>$1</strong>")
+    .replace(/~~(.+?)~~/g, "<s>$1</s>")
+    .replace(/==(.+?)==/g, '<mark data-highlight="important">$1</mark>')
+    .replace(/\*([^*]+?)\*/g, "<em>$1</em>");
+}
+
+function markdownToWikiHtml(value) {
   const text = String(value || "").replace(/\r\n?/g, "\n").trim();
   if (!text) return "<p><br></p>";
 
@@ -1513,25 +1729,26 @@ function plainTextToConceptHtml(value) {
   let listType = null;
   let listItems = [];
 
-  const inline = (line) => escapeHtml(line)
-    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-    .replace(/__(.+?)__/g, "<strong>$1</strong>")
-    .replace(/\*([^*]+?)\*/g, "<em>$1</em>");
-
   const flushParagraph = () => {
     if (!paragraph.length) return;
-    output.push(`<p>${paragraph.map(inline).join("<br>")}</p>`);
+    output.push(`<p>${paragraph.map(renderInlineMarkdown).join("<br>")}</p>`);
     paragraph = [];
   };
-
   const flushList = () => {
     if (!listItems.length || !listType) return;
-    output.push(`<${listType}>${listItems.map((item) => `<li>${inline(item)}</li>`).join("")}</${listType}>`);
+    output.push(`<${listType}>${listItems.map((item) => `<li>${renderInlineMarkdown(item)}</li>`).join("")}</${listType}>`);
     listType = null;
     listItems = [];
   };
+  const splitTableRow = (line) => line
+    .trim()
+    .replace(/^\|/, "")
+    .replace(/\|$/, "")
+    .split("|")
+    .map((cell) => cell.trim());
 
-  for (const rawLine of lines) {
+  for (let index = 0; index < lines.length; index += 1) {
+    const rawLine = lines[index];
     const line = rawLine.trimEnd();
     if (!line.trim()) {
       flushParagraph();
@@ -1539,15 +1756,50 @@ function plainTextToConceptHtml(value) {
       continue;
     }
 
-    const heading = line.match(/^#{1,3}\s+(.+)$/);
-    const bullet = line.match(/^[-•]\s+(.+)$/);
-    const ordered = line.match(/^\d+[.)]\s+(.+)$/);
+    if (/^```/.test(line.trim())) {
+      flushParagraph();
+      flushList();
+      const code = [];
+      index += 1;
+      while (index < lines.length && !/^```/.test(lines[index].trim())) {
+        code.push(lines[index]);
+        index += 1;
+      }
+      output.push(`<pre><code>${escapeHtml(code.join("\n"))}</code></pre>`);
+      continue;
+    }
+
+    const nextLine = lines[index + 1] || "";
+    const looksLikeTable = line.includes("|") && /^\s*\|?\s*:?-{3,}/.test(nextLine) && nextLine.includes("|");
+    if (looksLikeTable) {
+      flushParagraph();
+      flushList();
+      const headers = splitTableRow(line);
+      const rows = [];
+      index += 2;
+      while (index < lines.length && lines[index].includes("|") && lines[index].trim()) {
+        rows.push(splitTableRow(lines[index]));
+        index += 1;
+      }
+      index -= 1;
+      output.push(`<table><thead><tr>${headers.map((cell) => `<th>${renderInlineMarkdown(cell)}</th>`).join("")}</tr></thead><tbody>${rows.map((row) => `<tr>${headers.map((_, cellIndex) => `<td>${renderInlineMarkdown(row[cellIndex] || "")}</td>`).join("")}</tr>`).join("")}</tbody></table>`);
+      continue;
+    }
+
+    const heading = line.match(/^(#{1,6})\s+(.+)$/);
+    const bullet = line.match(/^\s*[-•+]\s+(.+)$/);
+    const ordered = line.match(/^\s*\d+[.)]\s+(.+)$/);
     const quote = line.match(/^>\s?(.+)$/);
 
     if (heading) {
       flushParagraph();
       flushList();
-      output.push(`<${heading[0].startsWith("###") ? "h3" : "h2"}>${inline(heading[1])}</${heading[0].startsWith("###") ? "h3" : "h2"}>`);
+      const level = Math.min(6, Math.max(2, heading[1].length + 1));
+      output.push(`<h${level}>${renderInlineMarkdown(heading[2])}</h${level}>`);
+    } else if (/^\s*(---+|___+|\*\*\*+)\s*$/.test(line)) {
+      flushParagraph();
+      flushList();
+      output.push("<hr>");
     } else if (bullet || ordered) {
       flushParagraph();
       const nextType = bullet ? "ul" : "ol";
@@ -1557,7 +1809,7 @@ function plainTextToConceptHtml(value) {
     } else if (quote) {
       flushParagraph();
       flushList();
-      output.push(`<blockquote>${inline(quote[1])}</blockquote>`);
+      output.push(`<blockquote>${renderInlineMarkdown(quote[1])}</blockquote>`);
     } else {
       flushList();
       paragraph.push(line);
@@ -1569,13 +1821,18 @@ function plainTextToConceptHtml(value) {
   return sanitizeConceptHtml(output.join(""));
 }
 
+function plainTextToConceptHtml(value) {
+  return markdownToWikiHtml(value);
+}
+
 function conceptOriginalText(concept, sourceChunks = []) {
-  if (concept?.content_original?.trim()) return concept.content_original;
   const fromChunks = sourceChunks
     .map((chunk) => chunk.translated_text?.trim() || chunk.source_text?.trim() || "")
     .filter(Boolean)
     .join("\n\n");
-  return fromChunks || concept?.summary || "";
+  if (fromChunks) return fromChunks;
+  if (concept?.content_original?.trim()) return concept.content_original;
+  return concept?.summary || "";
 }
 
 function conceptEditorHtml(concept, sourceChunks = []) {
@@ -2235,8 +2492,261 @@ function renderKnowledgeView() {
   });
 }
 
+function wikiConceptHtml(concept) {
+  const sourceChunks = state.chunks
+    .filter((chunk) => (concept.source_chunk_ids || []).includes(chunk.id))
+    .sort((a, b) => a.position - b.position);
+  if (concept.content_edited?.trim()) return sanitizeConceptHtml(concept.content_edited);
+  return markdownToWikiHtml(conceptOriginalText(concept, sourceChunks));
+}
+
+function wikiConceptSearchText(concept) {
+  return [
+    concept.title,
+    concept.summary,
+    ...(concept.tags || []),
+    stripHtmlText(concept.content_edited),
+    concept.content_original,
+    stripHtmlText(concept.personal_notes),
+  ].join(" ").toLocaleLowerCase("ro");
+}
+
+function wikiAnchor(value, prefix = "section") {
+  const normalized = String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLocaleLowerCase("ro")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 70);
+  return `${prefix}-${normalized || "item"}`;
+}
+
+function renderWikiView() {
+  const project = state.currentProject;
+  if (!project) return;
+  const query = state.wikiSearch.toLocaleLowerCase("ro").trim();
+  const chapters = state.chapters
+    .map((chapter) => {
+      const concepts = conceptsForChapter(chapter.id).filter((concept) => {
+        if (!query) return true;
+        return `${chapter.title} ${chapter.summary} ${wikiConceptSearchText(concept)}`.toLocaleLowerCase("ro").includes(query);
+      });
+      const chapterMatches = !query || `${chapter.title} ${chapter.summary}`.toLocaleLowerCase("ro").includes(query);
+      return { chapter, concepts: chapterMatches && !concepts.length ? conceptsForChapter(chapter.id) : concepts };
+    })
+    .filter(({ chapter, concepts }) => !query || concepts.length || `${chapter.title} ${chapter.summary}`.toLocaleLowerCase("ro").includes(query));
+
+  const toc = chapters.map(({ chapter, concepts }) => `
+    <div class="wiki-toc-chapter">
+      <button class="wiki-toc-link chapter" data-wiki-target="${wikiAnchor(chapter.id, "chapter")}">${escapeHtml(chapter.title)}</button>
+      <div>${concepts.map((concept) => `<button class="wiki-toc-link" data-wiki-target="${wikiAnchor(concept.id, "concept")}">${escapeHtml(concept.title)}</button>`).join("")}</div>
+    </div>`).join("");
+
+  const chapterSections = chapters.map(({ chapter, concepts }) => {
+    const chapterCollapsed = state.wikiCollapsedChapters.has(chapter.id);
+    const allChapterConcepts = conceptsForChapter(chapter.id);
+    const chapterChunkIds = [...new Set(allChapterConcepts.flatMap((concept) => concept.source_chunk_ids || []))];
+    const chapterChunks = state.chunks
+      .filter((chunk) => chapterChunkIds.includes(chunk.id))
+      .sort((a, b) => a.position - b.position);
+    const chapterMarkdown = chapterChunks
+      .map((chunk) => chunk.translated_text?.trim() || chunk.source_text?.trim() || "")
+      .filter(Boolean)
+      .join("\n\n---\n\n");
+
+    return `<details class="wiki-chapter" id="${wikiAnchor(chapter.id, "chapter")}" data-wiki-chapter-id="${chapter.id}" ${chapterCollapsed ? "" : "open"}>
+      <summary>
+        <div>
+          <span class="wiki-section-label">Capitol ${chapter.position + 1}</span>
+          <h2>${escapeHtml(chapter.title)}</h2>
+          ${chapter.summary ? `<p>${escapeHtml(chapter.summary)}</p>` : ""}
+        </div>
+        <span class="wiki-section-meta">${concepts.length} subcapitole · ${escapeHtml(pagesLabel(chapter.page_start, chapter.page_end))}</span>
+      </summary>
+      <div class="wiki-chapter-content">
+        ${chapterMarkdown ? `<details class="wiki-chapter-translation" open>
+          <summary><strong>Textul tradus al capitolului</strong><span>${chapterChunks.length} segmente · Markdown păstrat</span></summary>
+          <article class="wiki-rich-content wiki-chapter-markdown">${markdownToWikiHtml(chapterMarkdown)}</article>
+        </details>` : ""}
+        <div class="wiki-subchapter-heading"><span>Concepte și subcapitole</span><small>Editările personale apar aici ca pagini proprii.</small></div>
+        ${concepts.map((concept) => {
+          const sourceChunks = state.chunks
+            .filter((chunk) => (concept.source_chunk_ids || []).includes(chunk.id))
+            .sort((a, b) => a.position - b.position);
+          const conceptCollapsed = state.wikiCollapsedConcepts.has(concept.id);
+          const notes = notesEditorHtml(concept);
+          const highlightCount = conceptHighlightTotal(concept.content_edited || "");
+          const hasCustomPage = Boolean(concept.content_edited?.trim());
+          const conceptPage = hasCustomPage
+            ? `<article class="wiki-rich-content">${sanitizeConceptHtml(concept.content_edited)}</article>`
+            : `<div class="wiki-concept-unedited">
+                <p>${escapeHtml(concept.summary || "Acest concept a fost identificat în textul tradus al capitolului.")}</p>
+                <span>Conținutul complet se află mai sus, în textul tradus. Folosește „Editează și formatează” pentru a crea o pagină proprie, cu underline și highlights.</span>
+              </div>`;
+          return `<details class="wiki-concept" id="${wikiAnchor(concept.id, "concept")}" data-wiki-concept-id="${concept.id}" ${conceptCollapsed ? "" : "open"}>
+            <summary>
+              <div>
+                <h3>${escapeHtml(concept.title)}</h3>
+                ${concept.summary ? `<p>${escapeHtml(concept.summary)}</p>` : ""}
+              </div>
+              <div class="wiki-concept-summary-meta">
+                ${hasCustomPage ? '<span class="badge warning">pagină editată</span>' : '<span class="badge">index</span>'}
+                ${highlightCount ? `<span class="badge primary">${highlightCount} highlights</span>` : ""}
+                ${conceptHasNotes(concept) ? '<span class="badge">notițe</span>' : ""}
+              </div>
+            </summary>
+            <div class="wiki-concept-body">
+              ${(concept.tags || []).length ? `<div class="knowledge-tags">${concept.tags.map((tag) => `<span>${escapeHtml(tag)}</span>`).join("")}</div>` : ""}
+              ${conceptPage}
+              ${state.wikiShowNotes && conceptHasNotes(concept) ? `<aside class="wiki-personal-notes"><h4>📝 Notițele mele</h4><div>${notes}</div></aside>` : ""}
+              <footer class="wiki-concept-footer">
+                <span>${escapeHtml(pagesLabel(concept.page_start, concept.page_end))}${sourceChunks.length ? ` · ${sourceChunks.length} segmente sursă` : ""}</span>
+                <div>
+                  <button class="btn btn-ghost btn-sm wiki-open-source" data-concept-id="${concept.id}" ${sourceChunks.length ? "" : "disabled"}>Sursa</button>
+                  <button class="btn btn-primary btn-sm wiki-edit-concept" data-concept-id="${concept.id}">Editează și formatează</button>
+                </div>
+              </footer>
+            </div>
+          </details>`;
+        }).join("") || '<div class="empty-state"><p>Capitolul nu are concepte în această selecție.</p></div>'}
+      </div>
+    </details>`;
+  }).join("");
+
+  const setupMessage = state.knowledgeSetupError
+    ? `<div class="warning-box">Modul Wiki necesită schema de capitole și concepte. Traducerea rămâne disponibilă în tabul Traducere.</div>`
+    : "";
+
+  app.innerHTML = `<div class="app-shell wiki-shell">
+    ${topbar({ editor: true })}
+    <main class="container-wide">
+      <section class="editor-header wiki-project-header">
+        <div>
+          <div class="editor-title-line"><h1>${escapeHtml(project.title)}</h1><span class="badge primary">Faza 4 · Personal Wiki</span></div>
+          <div class="editor-subtitle">${state.chapters.length} capitole · ${state.concepts.length} concepte · formatarea și highlights-urile sunt păstrate</div>
+        </div>
+        <div class="editor-actions">
+          <button id="wiki-toggle-notes" class="btn btn-ghost btn-sm">${state.wikiShowNotes ? "Ascunde notițele" : "Arată notițele"}</button>
+          <button id="wiki-collapse-all" class="btn btn-ghost btn-sm">Restrânge tot</button>
+          <button id="wiki-expand-all" class="btn btn-ghost btn-sm">Extinde tot</button>
+          <button id="wiki-edit-project" class="btn btn-primary btn-sm">Editează proiectul</button>
+        </div>
+      </section>
+      ${projectViewTabs()}
+      ${setupMessage}
+      <section class="wiki-layout">
+        <aside class="wiki-sidebar">
+          <div class="wiki-search-box"><span>⌕</span><input id="wiki-search" class="input" value="${escapeHtml(state.wikiSearch)}" placeholder="Caută în această pagină Wiki…" /></div>
+          <div class="wiki-toc">${toc || '<div class="help">Nu există capitole.</div>'}</div>
+        </aside>
+        <article class="wiki-page">
+          <header class="wiki-page-cover">
+            <span class="library-eyebrow">${escapeHtml(project.source_filename || "Document medical")}</span>
+            <h1>${escapeHtml(project.title)}</h1>
+            <p>${state.chapters[0]?.summary ? escapeHtml(state.chapters[0].summary) : "Document tradus și organizat pentru lectură, revizuire și dezvoltare continuă."}</p>
+            <div class="wiki-page-stats">
+              <span>${project.page_count || "?"} pagini sursă</span>
+              <span>${state.chunks.filter((chunk) => chunk.translated_text?.trim()).length}/${state.chunks.length} segmente traduse</span>
+              <span>${state.concepts.filter((concept) => concept.manual_revision > 0).length} concepte editate</span>
+            </div>
+          </header>
+          <div class="wiki-document">${chapterSections || `<div class="empty-state knowledge-empty"><h3>${state.chapters.length ? "Nu există rezultate" : "Generează mai întâi capitolele"}</h3><p>${state.chapters.length ? "Schimbă termenul de căutare." : "Mergi în Concepte & editare și folosește Generează structura."}</p></div>`}</div>
+        </article>
+      </section>
+    </main>
+  </div>`;
+
+  attachTopbarListeners();
+  attachProjectViewTabs();
+  document.querySelector("#wiki-edit-project")?.addEventListener("click", () => {
+    state.projectView = "chapters";
+    syncProjectHash();
+    renderEditor();
+  });
+  document.querySelector("#wiki-toggle-notes")?.addEventListener("click", () => {
+    state.wikiShowNotes = !state.wikiShowNotes;
+    renderEditor();
+  });
+  document.querySelector("#wiki-collapse-all")?.addEventListener("click", () => {
+    state.wikiCollapsedChapters = new Set(state.chapters.map((chapter) => chapter.id));
+    state.wikiCollapsedConcepts = new Set(state.concepts.map((concept) => concept.id));
+    renderEditor();
+  });
+  document.querySelector("#wiki-expand-all")?.addEventListener("click", () => {
+    state.wikiCollapsedChapters.clear();
+    state.wikiCollapsedConcepts.clear();
+    renderEditor();
+  });
+  document.querySelector("#wiki-search")?.addEventListener("input", (event) => {
+    state.wikiSearch = event.target.value;
+    const caret = event.target.selectionStart;
+    renderEditor();
+    const input = document.querySelector("#wiki-search");
+    input?.focus();
+    input?.setSelectionRange(caret, caret);
+  });
+  document.querySelectorAll("[data-wiki-target]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const target = document.getElementById(button.dataset.wikiTarget);
+      if (!target) return;
+      if (target.tagName === "DETAILS") target.open = true;
+      target.closest("details.wiki-chapter")?.setAttribute("open", "");
+      target.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  });
+  document.querySelectorAll("[data-wiki-chapter-id]").forEach((details) => {
+    details.addEventListener("toggle", () => {
+      if (details.open) state.wikiCollapsedChapters.delete(details.dataset.wikiChapterId);
+      else state.wikiCollapsedChapters.add(details.dataset.wikiChapterId);
+    });
+  });
+  document.querySelectorAll("[data-wiki-concept-id]").forEach((details) => {
+    details.addEventListener("toggle", () => {
+      if (details.open) state.wikiCollapsedConcepts.delete(details.dataset.wikiConceptId);
+      else state.wikiCollapsedConcepts.add(details.dataset.wikiConceptId);
+    });
+  });
+  document.querySelectorAll(".wiki-edit-concept").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.selectedConceptId = button.dataset.conceptId;
+      state.projectView = "chapters";
+      syncProjectHash();
+      renderEditor();
+    });
+  });
+  document.querySelectorAll(".wiki-open-source").forEach((button) => {
+    button.addEventListener("click", () => {
+      const concept = state.concepts.find((item) => item.id === button.dataset.conceptId);
+      const firstChunk = state.chunks
+        .filter((chunk) => (concept?.source_chunk_ids || []).includes(chunk.id))
+        .sort((a, b) => a.position - b.position)[0];
+      if (!firstChunk) return;
+      state.currentIndex = firstChunk.position;
+      state.projectView = "translation";
+      syncProjectHash();
+      renderEditor();
+    });
+  });
+
+  if (state.wikiFocusConceptId) {
+    const focusId = state.wikiFocusConceptId;
+    state.wikiFocusConceptId = null;
+    requestAnimationFrame(() => {
+      const target = document.getElementById(wikiAnchor(focusId, "concept"));
+      if (!target) return;
+      target.open = true;
+      target.closest("details.wiki-chapter")?.setAttribute("open", "");
+      target.scrollIntoView({ behavior: "smooth", block: "start" });
+      target.classList.add("wiki-focus");
+      setTimeout(() => target.classList.remove("wiki-focus"), 2200);
+    });
+  }
+}
+
 function renderEditor() {
-  if (state.projectView === "chapters") renderKnowledgeView();
+  if (state.projectView === "wiki") renderWikiView();
+  else if (state.projectView === "chapters") renderKnowledgeView();
   else renderTranslationView();
 }
 
@@ -2571,6 +3081,8 @@ async function handleAuthenticatedSession(session) {
     state.projectView = "translation";
     state.selectedConceptId = null;
     state.knowledgeSetupError = null;
+    state.libraryKnowledge = { chapters: [], concepts: [] };
+    state.librarySetupError = null;
     renderAuth();
     return;
   }
@@ -2581,8 +3093,11 @@ async function handleAuthenticatedSession(session) {
     return;
   }
 
-  const hashMatch = window.location.hash.match(/^#project=([a-f0-9-]+)$/i);
-  if (hashMatch) await openProject(hashMatch[1]);
+  const route = parseAppHash();
+  if (route.projectId) await openProject(route.projectId, {
+    view: route.view || "wiki",
+    conceptId: route.conceptId || null,
+  });
   else await loadDashboard();
 }
 
@@ -2630,7 +3145,7 @@ async function start() {
 window.addEventListener("beforeunload", (event) => {
   saveDebounced?.cancel?.();
   conceptSaveDebounced?.cancel?.();
-  const hasDirtyConcept = state.concepts.some((concept) => concept._editorDirty);
+  const hasDirtyConcept = state.concepts.some((concept) => concept._editorDirty || concept._notesDirty);
   if (state.ai.running || state.knowledge.running || hasDirtyConcept) {
     event.preventDefault();
     event.returnValue = "";
@@ -2638,9 +3153,21 @@ window.addEventListener("beforeunload", (event) => {
 });
 window.addEventListener("hashchange", async () => {
   if (!state.session) return;
-  const match = window.location.hash.match(/^#project=([a-f0-9-]+)$/i);
-  if (match && state.currentProject?.id !== match[1]) await openProject(match[1]);
-  if (!match && state.currentProject) {
+  const route = parseAppHash();
+  if (route.projectId) {
+    if (state.currentProject?.id !== route.projectId) {
+      await openProject(route.projectId, { view: route.view || "wiki", conceptId: route.conceptId || null });
+      return;
+    }
+    if (route.view && ["translation", "chapters", "wiki"].includes(route.view)) state.projectView = route.view;
+    if (route.conceptId && state.concepts.some((concept) => concept.id === route.conceptId)) {
+      state.selectedConceptId = route.conceptId;
+      state.wikiFocusConceptId = route.conceptId;
+    }
+    renderEditor();
+    return;
+  }
+  if (state.currentProject) {
     await flushActiveEdits();
     state.currentProject = null;
     await loadDashboard();
