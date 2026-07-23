@@ -211,6 +211,58 @@ export async function getProjectChunks(projectId) {
   return data ?? [];
 }
 
+export async function getProjectKnowledge(projectId) {
+  const [chaptersResult, conceptsResult] = await Promise.all([
+    getSupabase()
+      .from("chapters")
+      .select("*")
+      .eq("project_id", projectId)
+      .order("position", { ascending: true }),
+    getSupabase()
+      .from("concepts")
+      .select("*")
+      .eq("project_id", projectId)
+      .order("position", { ascending: true }),
+  ]);
+
+  if (chaptersResult.error) throw chaptersResult.error;
+  if (conceptsResult.error) throw conceptsResult.error;
+
+  return {
+    chapters: chaptersResult.data ?? [],
+    concepts: conceptsResult.data ?? [],
+  };
+}
+
+export async function replaceProjectKnowledge(projectId, chapters) {
+  const payload = {
+    chapters: (chapters ?? []).map((chapter, chapterIndex) => ({
+      title: chapter.title,
+      summary: chapter.summary || "",
+      position: Number.isInteger(chapter.position) ? chapter.position : chapterIndex,
+      page_start: chapter.page_start ?? null,
+      page_end: chapter.page_end ?? null,
+      concepts: (chapter.concepts ?? []).map((concept, conceptIndex) => ({
+        title: concept.title,
+        summary: concept.summary || "",
+        position: Number.isInteger(concept.position) ? concept.position : conceptIndex,
+        page_start: concept.page_start ?? null,
+        page_end: concept.page_end ?? null,
+        source_chunk_ids: Array.isArray(concept.source_chunk_ids) ? concept.source_chunk_ids : [],
+        tags: Array.isArray(concept.tags) ? concept.tags : [],
+      })),
+    })),
+  };
+
+  const { error } = await getSupabase().rpc("replace_project_knowledge", {
+    p_project_id: projectId,
+    p_structure: payload,
+  });
+  if (error) throw error;
+
+  return getProjectKnowledge(projectId);
+}
+
 export async function createProject({ userId, title, file, pageCount, chunkSize, systemPrompt, chunks, uploadPdf }) {
   const { data: project, error: projectError } = await getSupabase()
     .from("projects")

@@ -6,6 +6,7 @@ import {
   getOriginalPdfUrl,
   getProject,
   getProjectChunks,
+  getProjectKnowledge,
   getSession,
   importBackup,
   initSupabase,
@@ -13,6 +14,7 @@ import {
   listGlossary,
   listProjects,
   onAuthChange,
+  replaceProjectKnowledge,
   resetPassword,
   signIn,
   signOut,
@@ -71,6 +73,21 @@ const state = {
   chunks: [],
   currentIndex: 0,
   chunkSearch: "",
+  projectView: "translation",
+  chapters: [],
+  concepts: [],
+  knowledgeSearch: "",
+  selectedConceptId: null,
+  collapsedChapters: new Set(),
+  knowledgeSetupError: null,
+  knowledge: {
+    running: false,
+    stopRequested: false,
+    completed: 0,
+    total: 0,
+    failed: [],
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+  },
   authMode: "signin",
   loading: false,
   deepseek: loadDeepSeekSession(),
@@ -171,6 +188,11 @@ function attachTopbarListeners() {
     await flushCurrentChunk();
     state.currentProject = null;
     state.chunks = [];
+    state.chapters = [];
+    state.concepts = [];
+    state.projectView = "translation";
+    state.selectedConceptId = null;
+    state.knowledgeSetupError = null;
     window.location.hash = "";
     await loadDashboard();
   });
@@ -824,14 +846,25 @@ async function openProject(projectId) {
   attachTopbarListeners();
 
   try {
-    [state.currentProject, state.chunks, state.glossary] = await Promise.all([
+    const [project, chunks, glossary, knowledge] = await Promise.all([
       getProject(projectId),
       getProjectChunks(projectId),
       listGlossary(),
+      getProjectKnowledge(projectId).catch((error) => ({ chapters: [], concepts: [], setupError: error })),
     ]);
+    state.currentProject = project;
+    state.chunks = chunks;
+    state.glossary = glossary;
+    state.chapters = knowledge.chapters;
+    state.concepts = knowledge.concepts;
+    state.knowledgeSetupError = knowledge.setupError || null;
     state.currentIndex = Math.max(0, state.chunks.findIndex((chunk) => chunk.status !== "approved"));
     if (state.currentIndex < 0) state.currentIndex = 0;
     state.chunkSearch = "";
+    state.knowledgeSearch = "";
+    state.projectView = "translation";
+    state.selectedConceptId = state.concepts[0]?.id ?? null;
+    state.collapsedChapters = new Set();
     window.location.hash = `project=${projectId}`;
     renderEditor();
   } catch (error) {
@@ -1057,7 +1090,538 @@ async function startAutoTranslation({ indices = null, onlyUntranslated = true, a
   }
 }
 
+const KNOWLEDGE_SYSTEM_PROMPT = `Ești un arhitect de cunoștințe medicale. Analizezi un singur segment dintr-un curs sau manual medical și îl transformi într-o structură pentru un wiki personal.
+
+Returnează EXCLUSIV un obiect JSON valid, fără Markdown, fără blocuri de cod și fără explicații, în forma:
+{
+  "chapter_title": "titlul capitolului în limba română sau __CONTINUE__",
+  "chapter_summary": "rezumat fidel în maximum două fraze",
+  "concepts": [
+    {
+      "title": "titlul clar al conceptului",
+      "summary": "rezumat fidel al conceptului în una până la trei fraze",
+      "tags": ["tag1", "tag2"]
+    }
+  ]
+}
+
+REGULI:
+1. Folosește numai informațiile prezente în segment. Nu completa din cunoștințe externe.
+2. Titlurile și rezumatele trebuie să fie în limba română, păstrând termenii medicali consacrați și abrevierile.
+3. Dacă segmentul continuă clar capitolul precedent și nu începe un capitol nou, folosește exact "__CONTINUE__".
+4. Identifică între 1 și 6 concepte utile pentru învățare. Nu crea concepte duplicate sau excesiv de generale.
+5. Fiecare tag trebuie să fie scurt. Folosește maximum 5 tag-uri pentru un concept.
+6. Păstrează cifrele, clasificările, pragurile, indicațiile și relațiile clinice importante în rezumate.
+7. Răspunsul trebuie să poată fi procesat direct cu JSON.parse().`;
+
+function projectViewTabs() {
+  const translatedCount = state.chunks.filter((item) => item.translated_text?.trim()).length;
+  return `<nav class="project-tabs" aria-label="Vizualizarea proiectului">
+    <button class="project-tab ${state.projectView === "translation" ? "active" : ""}" data-project-view="translation">
+      <span>Traducere</span><small>${translatedCount}/${state.chunks.length}</small>
+    </button>
+    <button class="project-tab ${state.projectView === "chapters" ? "active" : ""}" data-project-view="chapters">
+      <span>Capitole</span><small>${state.chapters.length} capitole · ${state.concepts.length} concepte</small>
+    </button>
+  </nav>`;
+}
+
+function attachProjectViewTabs() {
+  document.querySelectorAll("[data-project-view]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const nextView = button.dataset.projectView;
+      if (!nextView || nextView === state.projectView) return;
+      if (state.projectView === "translation") await flushCurrentChunk();
+      state.projectView = nextView;
+      if (nextView === "chapters" && !state.selectedConceptId) {
+        state.selectedConceptId = state.concepts[0]?.id ?? null;
+      }
+      renderEditor();
+    });
+  });
+}
+
+function normalizeKnowledgeTitle(value) {
+  return String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLocaleLowerCase("ro")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function cleanKnowledgeText(value, maxLength = 4000) {
+  return String(value || "").replace(/\s+/g, " ").trim().slice(0, maxLength);
+}
+
+function parseKnowledgeJson(rawText) {
+  let text = String(rawText || "").trim();
+  text = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  const firstBrace = text.indexOf("{");
+  const lastBrace = text.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) text = text.slice(firstBrace, lastBrace + 1);
+
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error(`DeepSeek nu a returnat JSON valid pentru structura capitolelor. Fragment: ${text.slice(0, 260)}`);
+  }
+
+  const chapterTitle = cleanKnowledgeText(parsed?.chapter_title, 300);
+  const chapterSummary = cleanKnowledgeText(parsed?.chapter_summary, 1200);
+  const concepts = Array.isArray(parsed?.concepts)
+    ? parsed.concepts
+      .map((concept) => ({
+        title: cleanKnowledgeText(concept?.title, 300),
+        summary: cleanKnowledgeText(concept?.summary, 1800),
+        tags: Array.isArray(concept?.tags)
+          ? [...new Set(concept.tags.map((tag) => cleanKnowledgeText(tag, 80)).filter(Boolean))].slice(0, 5)
+          : [],
+      }))
+      .filter((concept) => concept.title)
+      .slice(0, 8)
+    : [];
+
+  if (!chapterTitle) throw new Error("DeepSeek nu a identificat titlul capitolului.");
+  if (!concepts.length) throw new Error("DeepSeek nu a identificat niciun concept în segment.");
+
+  return {
+    chapter_title: chapterTitle,
+    chapter_summary: chapterSummary,
+    concepts,
+  };
+}
+
+function buildKnowledgeUserPrompt(chunk, previousChapterTitle, strictRetry = false) {
+  const workingText = chunk.translated_text?.trim() || chunk.source_text?.trim() || "";
+  return `${strictRetry ? "ATENȚIE: răspunsul anterior nu a putut fi procesat. Returnează numai JSON valid, fără niciun caracter înainte sau după obiect.\n\n" : ""}CAPITOL PRECEDENT IDENTIFICAT: ${previousChapterTitle || "niciunul — acesta este primul segment"}
+SEGMENT: ${chunk.position + 1}
+PAGINI SURSĂ: ${pagesLabel(chunk.page_start, chunk.page_end)}
+LIMBA TEXTULUI: ${chunk.translated_text?.trim() ? "română" : "textul sursă; rezultatul trebuie totuși redactat în română"}
+
+TEXT DE ANALIZAT:
+${workingText}`;
+}
+
+async function extractChunkKnowledgeWithRetry(chunk, previousChapterTitle, maxAttempts = 3) {
+  let lastError;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const response = await invokeDeepSeekTranslation({
+        apiKey: state.deepseek.apiKey,
+        model: state.deepseek.model,
+        systemPrompt: KNOWLEDGE_SYSTEM_PROMPT,
+        userPrompt: buildKnowledgeUserPrompt(chunk, previousChapterTitle, attempt > 1),
+      });
+      return {
+        structure: parseKnowledgeJson(response.translation),
+        usage: response.usage || null,
+      };
+    } catch (error) {
+      lastError = error;
+      const retryable = !error.status || [408, 429, 500, 502, 503, 504].includes(Number(error.status));
+      if (!retryable || attempt === maxAttempts || state.knowledge.stopRequested) break;
+      await sleep(attempt === 1 ? 900 : 2200);
+    }
+  }
+  throw lastError;
+}
+
+function appendUniqueSummary(existing, addition, limit = 1800) {
+  const current = cleanKnowledgeText(existing, limit);
+  const next = cleanKnowledgeText(addition, limit);
+  if (!next || current.includes(next)) return current;
+  if (!current) return next;
+  return `${current} ${next}`.slice(0, limit);
+}
+
+function mergeChunkKnowledge(accumulator, structure, chunk) {
+  const continuation = /^(__CONTINUE__|continuare|același capitol|acelasi capitol)$/i.test(structure.chapter_title);
+  const previousChapter = accumulator.at(-1) ?? null;
+  const requestedTitle = continuation
+    ? (previousChapter?.title || "Introducere")
+    : structure.chapter_title;
+  const title = requestedTitle || previousChapter?.title || `Capitol ${accumulator.length + 1}`;
+  const sameAsPrevious = previousChapter && normalizeKnowledgeTitle(previousChapter.title) === normalizeKnowledgeTitle(title);
+
+  const chapter = sameAsPrevious
+    ? previousChapter
+    : (() => {
+      const created = {
+        title,
+        summary: "",
+        position: accumulator.length,
+        page_start: chunk.page_start ?? null,
+        page_end: chunk.page_end ?? null,
+        concepts: [],
+      };
+      accumulator.push(created);
+      return created;
+    })();
+
+  chapter.summary = appendUniqueSummary(chapter.summary, structure.chapter_summary, 2200);
+  if (chunk.page_start) chapter.page_start = chapter.page_start ? Math.min(chapter.page_start, chunk.page_start) : chunk.page_start;
+  if (chunk.page_end) chapter.page_end = chapter.page_end ? Math.max(chapter.page_end, chunk.page_end) : chunk.page_end;
+
+  for (const candidate of structure.concepts) {
+    const key = normalizeKnowledgeTitle(candidate.title);
+    let concept = chapter.concepts.find((item) => normalizeKnowledgeTitle(item.title) === key);
+    if (!concept) {
+      concept = {
+        title: candidate.title,
+        summary: candidate.summary,
+        tags: [...candidate.tags],
+        position: chapter.concepts.length,
+        page_start: chunk.page_start ?? null,
+        page_end: chunk.page_end ?? null,
+        source_chunk_ids: [chunk.id],
+      };
+      chapter.concepts.push(concept);
+      continue;
+    }
+
+    concept.summary = appendUniqueSummary(concept.summary, candidate.summary, 2200);
+    concept.tags = [...new Set([...(concept.tags || []), ...candidate.tags])].slice(0, 8);
+    if (!concept.source_chunk_ids.includes(chunk.id)) concept.source_chunk_ids.push(chunk.id);
+    if (chunk.page_start) concept.page_start = concept.page_start ? Math.min(concept.page_start, chunk.page_start) : chunk.page_start;
+    if (chunk.page_end) concept.page_end = concept.page_end ? Math.max(concept.page_end, chunk.page_end) : chunk.page_end;
+  }
+
+  return chapter.title;
+}
+
+function showKnowledgeProgressModal() {
+  showModal(`
+    <div class="modal-head">
+      <h3>Generez capitolele și conceptele</h3>
+      <span class="badge primary">${escapeHtml(deepSeekModelLabel(state.deepseek.model))}</span>
+    </div>
+    <div class="modal-body form-grid">
+      <div id="knowledge-progress-message" class="info-box">Pregătesc segmentele…</div>
+      <div class="progress-track ai-progress-track"><div id="knowledge-progress-bar" class="progress-bar" style="width:0%"></div></div>
+      <div class="ai-progress-grid">
+        <div><span>Analizate</span><strong id="knowledge-progress-count">0 / ${state.knowledge.total}</strong></div>
+        <div><span>Erori</span><strong id="knowledge-error-count">0</strong></div>
+        <div><span>Tokeni</span><strong id="knowledge-token-count">0</strong></div>
+      </div>
+      <div class="info-box">Structura este construită segment cu segment. DeepSeek vede textul tradus când există, iar în rest folosește textul original. Informația nu este completată din surse externe.</div>
+    </div>
+    <div class="modal-footer">
+      <button id="stop-knowledge-generation" class="btn btn-danger" type="button">Oprește după segmentul curent</button>
+    </div>`, "modal-sm", { locked: true });
+
+  document.querySelector("#stop-knowledge-generation")?.addEventListener("click", () => {
+    state.knowledge.stopRequested = true;
+    const button = document.querySelector("#stop-knowledge-generation");
+    button.disabled = true;
+    button.textContent = "Se oprește…";
+  });
+}
+
+function updateKnowledgeProgress(message = "") {
+  const progress = state.knowledge.total
+    ? Math.round((state.knowledge.completed / state.knowledge.total) * 100)
+    : 0;
+  const totalTokens = state.knowledge.usage.total_tokens || 0;
+  const bar = document.querySelector("#knowledge-progress-bar");
+  const count = document.querySelector("#knowledge-progress-count");
+  const errors = document.querySelector("#knowledge-error-count");
+  const tokens = document.querySelector("#knowledge-token-count");
+  const messageElement = document.querySelector("#knowledge-progress-message");
+  if (bar) bar.style.width = `${progress}%`;
+  if (count) count.textContent = `${state.knowledge.completed} / ${state.knowledge.total}`;
+  if (errors) errors.textContent = String(state.knowledge.failed.length);
+  if (tokens) tokens.textContent = new Intl.NumberFormat("ro-RO").format(totalTokens);
+  if (messageElement && message) messageElement.textContent = message;
+}
+
+async function startKnowledgeGeneration() {
+  if (state.knowledgeSetupError) {
+    toast("Rulează mai întâi fișierul supabase/phase1_chapters.sql în SQL Editor.", "error", 7000);
+    return;
+  }
+
+  if (state.knowledge.running || state.ai.running) {
+    toast("Există deja un proces DeepSeek în desfășurare.", "error");
+    return;
+  }
+
+  state.deepseek = loadDeepSeekSession();
+  if (!state.deepseek) {
+    showDeepSeekSettingsModal({ required: true });
+    return;
+  }
+
+  if (state.chapters.length && !window.confirm("Regenerarea va înlocui structura actuală de capitole și concepte. Continui?")) return;
+  await flushCurrentChunk();
+
+  const targets = state.chunks.filter((chunk) => chunk.translated_text?.trim() || chunk.source_text?.trim());
+  if (!targets.length) {
+    toast("Proiectul nu conține text care să poată fi analizat.", "error");
+    return;
+  }
+
+  state.knowledge = {
+    running: true,
+    stopRequested: false,
+    completed: 0,
+    total: targets.length,
+    failed: [],
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+  };
+  showKnowledgeProgressModal();
+
+  const generatedChapters = [];
+  let previousChapterTitle = "";
+
+  for (const chunk of targets) {
+    if (state.knowledge.stopRequested) break;
+    updateKnowledgeProgress(`Analizez segmentul ${chunk.position + 1} din ${state.chunks.length} · ${pagesLabel(chunk.page_start, chunk.page_end)}…`);
+
+    try {
+      const result = await extractChunkKnowledgeWithRetry(chunk, previousChapterTitle);
+      previousChapterTitle = mergeChunkKnowledge(generatedChapters, result.structure, chunk);
+      const usage = result.usage || {};
+      state.knowledge.usage.prompt_tokens += Number(usage.prompt_tokens || 0);
+      state.knowledge.usage.completion_tokens += Number(usage.completion_tokens || 0);
+      state.knowledge.usage.total_tokens += Number(usage.total_tokens || 0);
+    } catch (error) {
+      state.knowledge.failed.push({
+        position: chunk.position,
+        message: error.message || "Eroare necunoscută",
+      });
+      if ([401, 402, 403].includes(Number(error.status))) state.knowledge.stopRequested = true;
+    } finally {
+      state.knowledge.completed += 1;
+      updateKnowledgeProgress();
+    }
+  }
+
+  if (!generatedChapters.length) {
+    state.knowledge.running = false;
+    closeModal();
+    const details = state.knowledge.failed[0]?.message || "Nu a fost generat niciun capitol.";
+    toast(details, "error", 7000);
+    return;
+  }
+
+  try {
+    updateKnowledgeProgress("Salvez structura în Supabase…");
+    const saved = await replaceProjectKnowledge(state.currentProject.id, generatedChapters);
+    state.chapters = saved.chapters;
+    state.concepts = saved.concepts;
+    state.knowledgeSetupError = null;
+    state.selectedConceptId = state.concepts[0]?.id ?? null;
+    state.collapsedChapters = new Set();
+    state.knowledge.running = false;
+    closeModal();
+    renderEditor();
+
+    if (state.knowledge.failed.length) {
+      const firstErrors = state.knowledge.failed.slice(0, 4)
+        .map((item) => `Segment ${item.position + 1}: ${item.message}`)
+        .join("\n");
+      toast(`Structura a fost salvată, dar ${state.knowledge.failed.length} segmente au fost omise. ${firstErrors}`, "error", 9000);
+    } else {
+      toast(`Am generat ${state.chapters.length} capitole și ${state.concepts.length} concepte.`, "success", 5000);
+    }
+  } catch (error) {
+    state.knowledge.running = false;
+    closeModal();
+    toast(error.message || "Nu am putut salva structura capitolelor.", "error", 7000);
+  }
+}
+
+function conceptsForChapter(chapterId) {
+  return state.concepts
+    .filter((concept) => concept.chapter_id === chapterId)
+    .sort((a, b) => a.position - b.position);
+}
+
+function selectedKnowledgeConcept() {
+  return state.concepts.find((concept) => concept.id === state.selectedConceptId) ?? state.concepts[0] ?? null;
+}
+
+function renderKnowledgeView() {
+  const project = state.currentProject;
+  if (!project) return;
+
+  const query = state.knowledgeSearch.toLocaleLowerCase("ro").trim();
+  const visibleChapters = state.chapters.map((chapter) => {
+    const chapterConcepts = conceptsForChapter(chapter.id);
+    if (!query) return { chapter, concepts: chapterConcepts };
+    const matchingConcepts = chapterConcepts.filter((concept) => {
+      const haystack = `${concept.title} ${concept.summary} ${(concept.tags || []).join(" ")}`.toLocaleLowerCase("ro");
+      return haystack.includes(query);
+    });
+    const chapterMatches = `${chapter.title} ${chapter.summary}`.toLocaleLowerCase("ro").includes(query);
+    return chapterMatches || matchingConcepts.length
+      ? { chapter, concepts: chapterMatches ? chapterConcepts : matchingConcepts }
+      : null;
+  }).filter(Boolean);
+
+  const visibleConceptIds = new Set(visibleChapters.flatMap((entry) => entry.concepts.map((concept) => concept.id)));
+  if (state.selectedConceptId && !visibleConceptIds.has(state.selectedConceptId) && query) {
+    state.selectedConceptId = visibleChapters[0]?.concepts[0]?.id ?? null;
+  }
+  if (!state.selectedConceptId && !query) state.selectedConceptId = state.concepts[0]?.id ?? null;
+
+  const selected = query && !visibleConceptIds.has(state.selectedConceptId)
+    ? null
+    : selectedKnowledgeConcept();
+  const selectedChapter = selected ? state.chapters.find((chapter) => chapter.id === selected.chapter_id) : null;
+
+  const tree = visibleChapters.map(({ chapter, concepts }) => {
+    const collapsed = state.collapsedChapters.has(chapter.id);
+    const items = concepts.map((concept) => `
+      <button class="concept-tree-item ${concept.id === selected?.id ? "active" : ""}" data-concept-id="${concept.id}">
+        <span class="concept-tree-dot"></span>
+        <span><strong>${escapeHtml(concept.title)}</strong><small>${escapeHtml(pagesLabel(concept.page_start, concept.page_end))}</small></span>
+      </button>`).join("");
+    return `<section class="knowledge-tree-chapter">
+      <button class="knowledge-chapter-row" data-toggle-chapter="${chapter.id}" aria-expanded="${!collapsed}">
+        <span class="chapter-chevron">${collapsed ? "›" : "⌄"}</span>
+        <span><strong>${escapeHtml(chapter.title)}</strong><small>${concepts.length} concepte · ${escapeHtml(pagesLabel(chapter.page_start, chapter.page_end))}</small></span>
+      </button>
+      <div class="concept-tree-list ${collapsed ? "collapsed" : ""}">${items || '<div class="help" style="padding:8px 12px">Niciun concept găsit.</div>'}</div>
+    </section>`;
+  }).join("");
+
+  const sourceChunks = selected
+    ? (selected.source_chunk_ids || [])
+      .map((chunkId) => state.chunks.find((chunk) => chunk.id === chunkId))
+      .filter(Boolean)
+      .sort((a, b) => a.position - b.position)
+    : [];
+
+  const setupMessage = state.knowledgeSetupError
+    ? `<div class="error-box"><strong>Schema pentru capitole nu este instalată.</strong><br>Rulează o singură dată fișierul <code>supabase/phase1_chapters.sql</code> în Supabase SQL Editor, apoi reîncarcă pagina.</div>`
+    : "";
+
+  const conceptContent = selected ? `
+    <article class="knowledge-concept-card">
+      <div class="knowledge-breadcrumb">${escapeHtml(selectedChapter?.title || "Capitol")}</div>
+      <div class="knowledge-concept-head">
+        <div>
+          <h2>${escapeHtml(selected.title)}</h2>
+          <p>${escapeHtml(selected.summary || "Nu există încă un rezumat pentru acest concept.")}</p>
+        </div>
+        <span class="badge primary">${escapeHtml(pagesLabel(selected.page_start, selected.page_end))}</span>
+      </div>
+      ${(selected.tags || []).length ? `<div class="knowledge-tags">${selected.tags.map((tag) => `<span>${escapeHtml(tag)}</span>`).join("")}</div>` : ""}
+      <div class="knowledge-actions">
+        <button id="open-concept-source" class="btn btn-primary btn-sm" ${sourceChunks.length ? "" : "disabled"}>Deschide primul segment sursă</button>
+        <span class="help">Editarea conceptului, notițele și highlight-urile vor fi adăugate în fazele următoare.</span>
+      </div>
+    </article>
+    <section class="knowledge-sources">
+      <div class="section-head compact"><div><h3>Fragmente asociate</h3><p>${sourceChunks.length} segmente legate de acest concept.</p></div></div>
+      ${sourceChunks.map((chunk) => `
+        <article class="knowledge-source-card">
+          <header>
+            <strong>Segment ${chunk.position + 1}</strong>
+            <span>${escapeHtml(pagesLabel(chunk.page_start, chunk.page_end))}</span>
+          </header>
+          <div class="knowledge-source-grid">
+            <div><h4>Traducere</h4><pre>${escapeHtml(chunk.translated_text || "Acest segment nu este încă tradus.")}</pre></div>
+            <details><summary>Text original</summary><pre>${escapeHtml(chunk.source_text || "")}</pre></details>
+          </div>
+        </article>`).join("") || '<div class="empty-state"><p>Conceptul nu are fragmente asociate.</p></div>'}
+    </section>` : `
+      <div class="empty-state knowledge-empty">
+        ${setupMessage}
+        <h3>${state.knowledgeSetupError ? "Activează schema pentru Faza 1" : state.chapters.length ? "Nu există concepte în această selecție" : "Construiește structura cursului"}</h3>
+        <p>${state.knowledgeSetupError ? "Traducerea existentă continuă să funcționeze; trebuie doar adăugate tabelele chapters și concepts în proiectul Supabase." : state.chapters.length ? "Schimbă termenul de căutare sau regenerează structura." : "DeepSeek va analiza segmentele pe rând și va crea o navigare pe capitole și concepte, păstrând legătura cu paginile și segmentele sursă."}</p>
+        <button id="generate-knowledge-empty" class="btn btn-accent" ${state.knowledgeSetupError ? "disabled" : ""}>✦ Generează capitolele cu DeepSeek</button>
+      </div>`;
+
+  app.innerHTML = `
+    <div class="app-shell">
+      ${topbar({ editor: true })}
+      <main class="container-wide">
+        <section class="editor-header">
+          <div>
+            <div class="editor-title-line">
+              <h1>${escapeHtml(project.title)}</h1>
+              <span class="badge primary">Faza 1 · Knowledge View</span>
+            </div>
+            <div class="editor-subtitle">${state.chapters.length} capitole · ${state.concepts.length} concepte · structură generată din segmentele proiectului</div>
+          </div>
+          <div class="editor-actions">
+            <button id="generate-knowledge" class="btn btn-accent btn-sm" ${state.knowledge.running || state.ai.running || state.knowledgeSetupError ? "disabled" : ""}>✦ ${state.chapters.length ? "Regenerează structura" : "Generează structura"}</button>
+            <button id="project-settings" class="btn btn-ghost btn-sm">Setări proiect</button>
+            <button id="export-project" class="btn btn-primary btn-sm">Exportă</button>
+          </div>
+        </section>
+
+        ${projectViewTabs()}
+
+        <section class="knowledge-layout">
+          <aside class="knowledge-sidebar">
+            <div class="sidebar-head">
+              <input id="knowledge-search" class="input" value="${escapeHtml(state.knowledgeSearch)}" placeholder="Caută capitole sau concepte…" />
+              <span class="help">${visibleChapters.length} capitole afișate</span>
+            </div>
+            <div class="knowledge-tree">${tree || '<div class="help" style="padding:16px">Nu există rezultate.</div>'}</div>
+          </aside>
+          <main class="knowledge-main">${conceptContent}</main>
+        </section>
+      </main>
+    </div>`;
+
+  attachTopbarListeners();
+  attachProjectViewTabs();
+  attachKnowledgeListeners(sourceChunks);
+}
+
+function attachKnowledgeListeners(sourceChunks = []) {
+  document.querySelector("#generate-knowledge")?.addEventListener("click", startKnowledgeGeneration);
+  document.querySelector("#generate-knowledge-empty")?.addEventListener("click", startKnowledgeGeneration);
+  document.querySelector("#project-settings")?.addEventListener("click", showProjectSettingsModal);
+  document.querySelector("#export-project")?.addEventListener("click", showExportModal);
+
+  document.querySelectorAll("[data-concept-id]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.selectedConceptId = button.dataset.conceptId;
+      renderEditor();
+    });
+  });
+
+  document.querySelectorAll("[data-toggle-chapter]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const id = button.dataset.toggleChapter;
+      if (state.collapsedChapters.has(id)) state.collapsedChapters.delete(id);
+      else state.collapsedChapters.add(id);
+      renderEditor();
+    });
+  });
+
+  document.querySelector("#knowledge-search")?.addEventListener("input", (event) => {
+    state.knowledgeSearch = event.target.value;
+    const caret = event.target.selectionStart;
+    renderEditor();
+    const input = document.querySelector("#knowledge-search");
+    input?.focus();
+    input?.setSelectionRange(caret, caret);
+  });
+
+  document.querySelector("#open-concept-source")?.addEventListener("click", () => {
+    const firstChunk = sourceChunks[0];
+    if (!firstChunk) return;
+    state.currentIndex = firstChunk.position;
+    state.projectView = "translation";
+    renderEditor();
+  });
+}
+
 function renderEditor() {
+  if (state.projectView === "chapters") renderKnowledgeView();
+  else renderTranslationView();
+}
+
+
+function renderTranslationView() {
   const project = state.currentProject;
   const chunk = state.chunks[state.currentIndex];
   if (!project || !chunk) {
@@ -1112,6 +1676,8 @@ function renderEditor() {
           </div>
         </section>
 
+        ${projectViewTabs()}
+
         <section class="editor-grid">
           <aside class="chunk-sidebar">
             <div class="sidebar-head">
@@ -1158,6 +1724,7 @@ function renderEditor() {
     </div>`;
 
   attachTopbarListeners();
+  attachProjectViewTabs();
   attachEditorListeners();
 }
 
@@ -1379,6 +1946,11 @@ async function handleAuthenticatedSession(session) {
     state.projects = [];
     state.currentProject = null;
     state.chunks = [];
+    state.chapters = [];
+    state.concepts = [];
+    state.projectView = "translation";
+    state.selectedConceptId = null;
+    state.knowledgeSetupError = null;
     renderAuth();
     return;
   }
