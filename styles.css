@@ -1492,3 +1492,201 @@ html[data-theme="dark"] .lecture-page-blank { background: rgba(18,27,34,.45); }
   .lecture-section-editor { min-height: calc(100vh - 270px); padding: 22px 17px; border-radius: 4px; }
   .lecture-edit-footer { align-items: flex-start; flex-direction: column; }
 }
+
+/* =========================================================
+   FAZA 6 — Wiki links, backlinks și Knowledge Graph
+   ========================================================= */
+.internal-wiki-link {
+  display: inline;
+  color: var(--primary);
+  font-weight: 800;
+  text-decoration: none;
+  border-bottom: 1px dashed currentColor;
+  background: color-mix(in srgb, var(--primary-soft) 58%, transparent);
+  border-radius: 5px;
+  padding: 0 .16em;
+  cursor: pointer;
+  transition: background .15s ease, color .15s ease, box-shadow .15s ease;
+}
+.internal-wiki-link:hover,
+.internal-wiki-link:focus-visible {
+  color: var(--primary-dark);
+  background: var(--primary-soft);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 16%, transparent);
+  outline: none;
+}
+.wiki-link-tool {
+  color: var(--primary-dark);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  letter-spacing: -.05em;
+}
+
+.wiki-backlinks {
+  margin-top: 20px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 13px;
+  background: var(--surface-alt);
+}
+.wiki-backlinks-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 11px;
+}
+.wiki-backlinks-head h4 { margin: 0; color: var(--navy); font-size: 14px; }
+.wiki-backlinks-head > span {
+  min-width: 28px;
+  height: 28px;
+  padding: 0 8px;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 999px;
+  color: var(--primary-dark);
+  background: var(--primary-soft);
+  font-weight: 850;
+  font-size: 12px;
+}
+.wiki-backlink-list { display: grid; gap: 8px; }
+.wiki-backlink-card {
+  width: 100%;
+  padding: 11px 12px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 4px 9px;
+  align-items: center;
+  text-align: left;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.wiki-backlink-card:hover { border-color: var(--primary); box-shadow: 0 5px 18px rgba(15,118,110,.10); }
+.wiki-backlink-card strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--navy); }
+.wiki-backlink-card small { color: var(--muted); font-size: 10px; }
+.wiki-backlink-card p {
+  grid-column: 2 / -1;
+  margin: 3px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.graph-setup-card,
+.graph-workspace {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 17px;
+  box-shadow: var(--shadow);
+}
+.graph-setup-card { padding: 28px; }
+.graph-setup-card h2 { margin-top: 0; color: var(--navy); }
+.graph-toolbar {
+  min-height: 76px;
+  padding: 14px 17px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  border-bottom: 1px solid var(--border);
+}
+.graph-toolbar h2 { margin: 0; color: var(--navy); }
+.graph-toolbar p { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
+.graph-controls { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; justify-content: flex-end; }
+.graph-controls .input { width: min(300px, 32vw); }
+.graph-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.graph-check input { accent-color: var(--primary); }
+.graph-layout {
+  min-height: 620px;
+  height: min(74vh, 820px);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 330px;
+}
+.knowledge-graph-canvas {
+  min-width: 0;
+  height: 100%;
+  position: relative;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 15% 20%, rgba(15,118,110,.06), transparent 30%),
+    radial-gradient(circle at 86% 75%, rgba(79,111,189,.07), transparent 30%),
+    var(--surface-alt);
+}
+.graph-loading { height: 100%; display: grid; place-content: center; justify-items: center; gap: 12px; color: var(--muted); }
+.knowledge-graph-panel {
+  min-width: 0;
+  padding: 19px;
+  overflow-y: auto;
+  border-left: 1px solid var(--border);
+  background: var(--surface);
+}
+.graph-panel-empty { min-height: 100%; display: grid; place-content: center; text-align: center; color: var(--muted); }
+.graph-panel-empty h3 { margin: 8px 0 4px; color: var(--navy); }
+.graph-panel-empty p { max-width: 240px; margin: 0; line-height: 1.55; }
+.graph-panel-icon { font-size: 38px; color: var(--primary); }
+.graph-panel-content h2 { margin: 13px 0 4px; color: var(--navy); line-height: 1.15; }
+.graph-panel-project { color: var(--primary); font-size: 12px; font-weight: 800; }
+.graph-panel-content > p { color: var(--muted); line-height: 1.62; }
+.graph-panel-actions { margin-top: 18px; display: grid; }
+.graph-legend {
+  min-height: 42px;
+  padding: 8px 16px;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  flex-wrap: wrap;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 10px;
+}
+.graph-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend-dot { width: 10px; height: 10px; display: inline-block; border-radius: 50%; border: 1px solid transparent; }
+.legend-dot.chapter { border-radius: 3px; background: #dff5f1; border-color: #0f766e; }
+.legend-dot.concept { background: #e8efff; border-color: #4f6fbd; }
+.legend-dot.lecture { border-radius: 999px; background: #fff3cf; border-color: #c88713; }
+.legend-line { width: 23px; height: 0; display: inline-block; border-top: 2px solid #7b8da2; }
+.legend-line.explicit { border-color: var(--primary); }
+.legend-line.structural { border-top-style: dashed; }
+
+html[data-theme="dark"] .internal-wiki-link {
+  color: #70e1d1;
+  background: rgba(38,166,154,.14);
+}
+html[data-theme="dark"] .internal-wiki-link:hover { color: #b7fff5; background: rgba(38,166,154,.24); }
+html[data-theme="dark"] .knowledge-graph-canvas {
+  background:
+    radial-gradient(circle at 18% 18%, rgba(53,189,178,.08), transparent 30%),
+    radial-gradient(circle at 82% 78%, rgba(116,145,220,.08), transparent 30%),
+    #0b1218;
+}
+html[data-theme="dark"] .legend-dot.chapter { background: #173b46; border-color: #4cc9b7; }
+html[data-theme="dark"] .legend-dot.concept { background: #263449; border-color: #8ba9ff; }
+html[data-theme="dark"] .legend-dot.lecture { background: #49391d; border-color: #f0b94b; }
+
+@media (max-width: 1000px) {
+  .graph-toolbar { align-items: flex-start; flex-direction: column; }
+  .graph-controls { width: 100%; justify-content: flex-start; }
+  .graph-controls .input { flex: 1 1 260px; width: auto; }
+  .graph-layout { grid-template-columns: minmax(0, 1fr); height: auto; }
+  .knowledge-graph-canvas { height: 62vh; min-height: 480px; }
+  .knowledge-graph-panel { min-height: 190px; max-height: 330px; border-left: 0; border-top: 1px solid var(--border); }
+}
+@media (max-width: 620px) {
+  .graph-layout { min-height: 0; }
+  .knowledge-graph-canvas { height: 58vh; min-height: 390px; }
+  .graph-controls { gap: 7px; }
+  .graph-controls .input { flex-basis: 100%; }
+  .graph-legend { gap: 10px; }
+  .wiki-backlink-card { grid-template-columns: auto minmax(0, 1fr); }
+  .wiki-backlink-card small { grid-column: 2; }
+  .wiki-backlink-card p { grid-column: 1 / -1; }
+}

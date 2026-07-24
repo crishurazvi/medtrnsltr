@@ -8,6 +8,9 @@ import {
   getProjectChunks,
   getProjectKnowledge,
   getProjectLectureSections,
+  getProjectBacklinks,
+  getKnowledgeGraphData,
+  getLinkableSources,
   getSession,
   importBackup,
   initSupabase,
@@ -18,6 +21,7 @@ import {
   onAuthChange,
   replaceProjectKnowledge,
   resetPassword,
+  resolveConceptReference,
   saveConceptEditor,
   saveConceptNotes,
   saveLectureSection,
@@ -25,6 +29,7 @@ import {
   signOut,
   signUp,
   syncProjectLectureSections,
+  syncContentLinks,
   updateChunk,
   updatePassword,
   updateProject,
@@ -51,6 +56,15 @@ import {
   buildLectureSourceSections,
   lectureSectionsNeedSync,
 } from "./lecture-tools.js";
+import {
+  decorateWikiLinksInHtml,
+  extractWikiLinksFromHtml,
+  serializeWikiLinksForRpc,
+} from "./wiki-links.js";
+import {
+  createKnowledgeGraph,
+  updateKnowledgeGraphTheme,
+} from "./knowledge-graph.js";
 import {
   exportBackup,
   exportHtml,
@@ -83,6 +97,14 @@ const state = {
   librarySearch: "",
   libraryKnowledge: { chapters: [], concepts: [] },
   librarySetupError: null,
+  graphData: { projects: [], chapters: [], concepts: [], lecture_sections: [], links: [] },
+  graphSetupError: null,
+  graphSearch: "",
+  graphShowChapters: true,
+  graphShowLecture: true,
+  graphNetwork: null,
+  graphModel: null,
+  graphSelectedNodeId: null,
   currentProject: null,
   chunks: [],
   currentIndex: 0,
@@ -94,6 +116,8 @@ const state = {
   selectedConceptId: null,
   collapsedChapters: new Set(),
   knowledgeSetupError: null,
+  projectBacklinks: [],
+  backlinkSetupError: null,
   wikiSearch: "",
   wikiShowNotes: true,
   wikiCollapsedChapters: new Set(),
@@ -105,6 +129,7 @@ const state = {
   lectureEditingSectionId: null,
   lectureFontScale: 1,
   lectureSyncing: false,
+  lectureFocusSectionId: null,
   theme: localStorage.getItem("medtranslate-theme") === "dark" ? "dark" : "light",
   knowledge: {
     running: false,
@@ -183,6 +208,7 @@ function applyTheme(theme) {
     button.textContent = next === "dark" ? "☀ Mod luminos" : "☾ Mod întunecat";
     button.title = next === "dark" ? "Activează tema luminoasă" : "Activează tema întunecată";
   });
+  if (state.graphNetwork) updateKnowledgeGraphTheme(state.graphNetwork, next);
 }
 
 function toggleTheme() {
@@ -257,6 +283,9 @@ function attachTopbarListeners() {
     state.lectureSections = [];
     state.lectureSetupError = null;
     state.lectureEditingSectionId = null;
+    state.lectureFocusSectionId = null;
+    state.projectBacklinks = [];
+    state.backlinkSetupError = null;
     state.projectView = "translation";
     state.selectedConceptId = null;
     state.libraryKnowledge = { chapters: [], concepts: [] };
@@ -607,10 +636,13 @@ async function loadDashboard() {
   attachTopbarListeners();
 
   try {
-    const [projects, glossary, libraryKnowledge] = await Promise.all([
+    const [projects, glossary, libraryKnowledge, graphData] = await Promise.all([
       listProjects(),
       listGlossary(),
       listLibraryKnowledge().catch((error) => ({ chapters: [], concepts: [], setupError: error })),
+      getKnowledgeGraphData()
+        .then((data) => ({ data, setupError: null }))
+        .catch((error) => ({ data: { projects: [], chapters: [], concepts: [], lecture_sections: [], links: [] }, setupError: error })),
     ]);
     state.projects = projects;
     state.glossary = glossary;
@@ -619,6 +651,8 @@ async function loadDashboard() {
       concepts: libraryKnowledge.concepts ?? [],
     };
     state.librarySetupError = libraryKnowledge.setupError || null;
+    state.graphData = graphData.data;
+    state.graphSetupError = graphData.setupError || null;
     renderDashboard();
   } catch (error) {
     app.innerHTML = `${topbar()}<main class="container"><div class="error-box">${escapeHtml(error.message)}</div></main>`;
@@ -664,10 +698,151 @@ function renderDashboardTabs() {
     <button class="dashboard-tab ${state.dashboardView === "library" ? "active" : ""}" data-dashboard-view="library">
       <span>📚 Bibliotecă Wiki</span><small>Citește și caută în toate cursurile</small>
     </button>
+    <button class="dashboard-tab ${state.dashboardView === "graph" ? "active" : ""}" data-dashboard-view="graph">
+      <span>◎ Knowledge Graph</span><small>Relații între concepte și capitole</small>
+    </button>
     <button class="dashboard-tab ${state.dashboardView === "projects" ? "active" : ""}" data-dashboard-view="projects">
       <span>🛠 Proiecte</span><small>Import, traducere și administrare</small>
     </button>
   </nav>`;
+}
+
+function graphNodePanelHtml(node) {
+  if (!node) {
+    return `<div class="graph-panel-empty"><span class="graph-panel-icon">◎</span><h3>Selectează un nod</h3><p>Click pe un concept, capitol sau o secțiune Lecture pentru detalii și navigare.</p></div>`;
+  }
+  const typeLabels = { concept: "Concept", chapter: "Capitol", lecture: "Lecture Mode", unresolved: "Legătură nerezolvată" };
+  const raw = node.raw || {};
+  const project = node.project || {};
+  const summary = raw.summary || (node.type === "lecture" ? "Secțiune din cursul paginat." : "Nu există încă un rezumat.");
+  const action = node.type === "concept"
+    ? `<button class="btn btn-primary graph-open-wiki" data-project-id="${raw.project_id}" data-concept-id="${raw.id}">Deschide în Wiki</button>`
+    : node.type === "chapter"
+      ? `<button class="btn btn-primary graph-open-wiki" data-project-id="${raw.project_id}">Deschide proiectul în Wiki</button>`
+      : node.type === "lecture"
+        ? `<button class="btn btn-accent graph-open-lecture" data-project-id="${raw.project_id}" data-section-id="${raw.id}">Deschide în Lecture Mode</button>`
+        : "";
+  return `<div class="graph-panel-content">
+    <span class="badge primary">${typeLabels[node.type] || node.type}</span>
+    <h2>${escapeHtml(node.label || raw.title || "Nod")}</h2>
+    ${project.title ? `<div class="graph-panel-project">${escapeHtml(project.title)}</div>` : ""}
+    <p>${escapeHtml(summary)}</p>
+    ${raw.tags?.length ? `<div class="knowledge-tags">${raw.tags.map((tag) => `<span>${escapeHtml(tag)}</span>`).join("")}</div>` : ""}
+    ${node.type === "unresolved" ? `<div class="warning-box">Conceptul indicat de sintaxa <code>[[...]]</code> nu a putut fi rezolvat.</div>` : ""}
+    <div class="graph-panel-actions">${action}</div>
+  </div>`;
+}
+
+function renderKnowledgeGraphDashboard() {
+  const links = state.graphData?.links?.length || 0;
+  const concepts = state.graphData?.concepts?.length || 0;
+  const chapters = state.graphData?.chapters?.length || 0;
+  if (state.graphSetupError) {
+    return `<section class="graph-setup-card"><h2>Activează Knowledge Graph</h2><p>Rulează <code>supabase/phase6_knowledge_graph.sql</code> în Supabase SQL Editor.</p><div class="error-box">${escapeHtml(state.graphSetupError.message || "Schema Fazei 6 nu este disponibilă.")}</div></section>`;
+  }
+  return `<section class="graph-workspace">
+    <header class="graph-toolbar">
+      <div><h2>Knowledge Graph</h2><p>${concepts} concepte · ${chapters} capitole · ${links} legături explicite</p></div>
+      <div class="graph-controls">
+        <input id="graph-search" class="input" value="${escapeHtml(state.graphSearch)}" placeholder="Filtrează nodurile…" />
+        <label class="graph-check"><input id="graph-show-chapters" type="checkbox" ${state.graphShowChapters ? "checked" : ""}> Capitole</label>
+        <label class="graph-check"><input id="graph-show-lecture" type="checkbox" ${state.graphShowLecture ? "checked" : ""}> Lecture</label>
+        <button id="graph-reindex" class="btn btn-ghost btn-sm">Reindexează [[linkurile]]</button>
+        <button id="graph-fit" class="btn btn-ghost btn-sm">Încadrează</button>
+      </div>
+    </header>
+    <div class="graph-layout">
+      <div id="knowledge-graph-canvas" class="knowledge-graph-canvas"><div class="graph-loading"><span class="loader loader-dark"></span> Se construiește graful…</div></div>
+      <aside id="knowledge-graph-panel" class="knowledge-graph-panel">${graphNodePanelHtml(null)}</aside>
+    </div>
+    <footer class="graph-legend">
+      <span><i class="legend-dot chapter"></i> Capitol</span>
+      <span><i class="legend-dot concept"></i> Concept</span>
+      <span><i class="legend-dot lecture"></i> Lecture</span>
+      <span><i class="legend-line explicit"></i> [[Legătură]]</span>
+      <span><i class="legend-line structural"></i> Apartenență la capitol</span>
+    </footer>
+  </section>`;
+}
+
+async function reindexAllWikiLinks() {
+  showModal(`<div class="modal-head"><h3>Reindexare [[linkuri]]</h3></div><div class="modal-body"><div class="progress-track"><div id="reindex-progress" class="progress-bar" style="width:0%"></div></div><p id="reindex-message" class="help">Citesc conținutul editat…</p></div>`, "modal-sm", { locked: true });
+  try {
+    const sources = await getLinkableSources();
+    const jobs = [];
+    sources.concepts.forEach((concept) => {
+      jobs.push({ type: "concept_content", id: concept.id, html: concept.content_edited || "" });
+      jobs.push({ type: "concept_notes", id: concept.id, html: concept.personal_notes || "" });
+    });
+    sources.lectureSections.forEach((section) => {
+      jobs.push({ type: "lecture_section", id: section.id, html: section.content_edited || section.source_markdown || "" });
+    });
+    for (let index = 0; index < jobs.length; index += 1) {
+      const job = jobs[index];
+      const links = serializeWikiLinksForRpc(extractWikiLinksFromHtml(job.html));
+      await syncContentLinks(job.type, job.id, links);
+      const percent = jobs.length ? Math.round(((index + 1) / jobs.length) * 100) : 100;
+      const bar = document.querySelector("#reindex-progress");
+      const message = document.querySelector("#reindex-message");
+      if (bar) bar.style.width = `${percent}%`;
+      if (message) message.textContent = `Indexez ${index + 1} din ${jobs.length} surse…`;
+    }
+    state.graphData = await getKnowledgeGraphData();
+    state.graphSetupError = null;
+    closeModal();
+    renderDashboard();
+    toast("Toate legăturile interne au fost reindexate.", "success", 3200);
+  } catch (error) {
+    closeModal();
+    toast(error.message || "Reindexarea linkurilor a eșuat.", "error", 6200);
+  }
+}
+
+async function initializeKnowledgeGraphDashboard() {
+  if (state.dashboardView !== "graph" || state.graphSetupError) return;
+  const container = document.querySelector("#knowledge-graph-canvas");
+  if (!container) return;
+  state.graphNetwork?.destroy?.();
+  state.graphNetwork = null;
+  try {
+    const result = await createKnowledgeGraph(container, state.graphData, {
+      theme: state.theme,
+      search: state.graphSearch,
+      showChapters: state.graphShowChapters,
+      showLecture: state.graphShowLecture,
+    });
+    state.graphNetwork = result.network;
+    state.graphModel = result.model;
+    result.network.on("click", (params) => {
+      const nodeId = params.nodes?.[0] || null;
+      state.graphSelectedNodeId = nodeId;
+      const node = result.model.nodes.find((item) => item.id === nodeId) || null;
+      const panel = document.querySelector("#knowledge-graph-panel");
+      if (panel) panel.innerHTML = graphNodePanelHtml(node);
+      attachGraphPanelListeners();
+    });
+    result.network.on("doubleClick", (params) => {
+      const node = result.model.nodes.find((item) => item.id === params.nodes?.[0]);
+      if (node?.type === "concept") openProject(node.raw.project_id, { view: "wiki", conceptId: node.raw.id });
+    });
+  } catch (error) {
+    container.innerHTML = `<div class="error-box">${escapeHtml(error.message || "Nu am putut inițializa Vis Network.")}</div>`;
+  }
+}
+
+function attachGraphPanelListeners() {
+  document.querySelectorAll(".graph-open-wiki").forEach((button) => {
+    button.addEventListener("click", () => openProject(button.dataset.projectId, {
+      view: "wiki",
+      conceptId: button.dataset.conceptId || null,
+    }));
+  });
+  document.querySelectorAll(".graph-open-lecture").forEach((button) => {
+    button.addEventListener("click", () => openProject(button.dataset.projectId, {
+      view: "lecture",
+      lectureSectionId: button.dataset.sectionId || null,
+    }));
+  });
 }
 
 function renderProjectManagementCards() {
@@ -760,6 +935,8 @@ function renderLibraryCards() {
 
 function renderDashboard() {
   document.body.classList.remove("lecture-active");
+  state.graphNetwork?.destroy?.();
+  state.graphNetwork = null;
   const totalChunks = state.projects.reduce((sum, project) => sum + project.chunkCount, 0);
   const translatedChunks = state.projects.reduce((sum, project) => sum + project.translatedCount, 0);
   const totalConcepts = state.libraryKnowledge.concepts.length;
@@ -767,54 +944,33 @@ function renderDashboard() {
     ? '<div class="warning-box">Biblioteca Wiki necesită schema Fazelor 1–3. Traducerea și proiectele continuă să funcționeze.</div>'
     : "";
 
+  let mainContent;
+  if (state.dashboardView === "graph") {
+    mainContent = renderKnowledgeGraphDashboard();
+  } else if (state.dashboardView === "library") {
+    mainContent = `<section class="library-toolbar">
+      <div><h2>Toată biblioteca</h2><p>Rezultatele includ titluri, rezumate, tag-uri, conținut editat, notițe și traduceri.</p></div>
+      <div class="library-search-wrap"><span>⌕</span><input id="library-search" class="input" value="${escapeHtml(state.librarySearch)}" placeholder="Caută în întreaga bibliotecă…" /></div>
+    </section><section class="library-grid">${renderLibraryCards()}</section>`;
+  } else {
+    mainContent = `<section class="hero compact-hero">
+      <div class="hero-main"><h1>Administrarea proiectelor</h1><p>Importă PDF-uri, traduce segmentele și construiește structura de capitole și concepte.</p>
+        <div class="dashboard-actions"><button id="create-project" class="btn btn-primary">＋ Proiect nou</button><button id="import-backup" class="btn btn-ghost">Importă backup JSON</button><button id="manage-glossary" class="btn btn-ghost">Glosar (${state.glossary.length})</button></div>
+      </div>
+      <div class="hero-card"><div class="metric"><span>Proiecte</span><strong>${state.projects.length}</strong></div><div class="metric"><span>Segmente traduse</span><strong>${translatedChunks}/${totalChunks}</strong></div><div class="metric"><span>Concepte</span><strong>${totalConcepts}</strong></div></div>
+    </section><section class="projects-grid">${renderProjectManagementCards()}</section>`;
+  }
+
   app.innerHTML = `<div class="app-shell">
     ${topbar()}
     <main class="container library-container">
       <section class="library-hero">
-        <div>
-          <span class="library-eyebrow">MedTranslate Personal Wiki</span>
-          <h1>Biblioteca ta medicală, construită din traduceri.</h1>
-          <p>Caută în toate cursurile, citește proiectele ca pagini Wiki și revino oricând în editor pentru a păstra propriile formatări, sublinieri și highlights.</p>
-        </div>
-        <div class="library-metrics">
-          <div><strong>${state.projects.length}</strong><span>cursuri și proiecte</span></div>
-          <div><strong>${totalConcepts}</strong><span>concepte indexate</span></div>
-          <div><strong>${translatedChunks}/${totalChunks}</strong><span>segmente traduse</span></div>
-        </div>
+        <div><span class="library-eyebrow">MedTranslate Personal Wiki</span><h1>Biblioteca ta medicală, construită din traduceri.</h1><p>Caută în toate cursurile, urmărește relațiile dintre concepte și revino oricând în editor.</p></div>
+        <div class="library-metrics"><div><strong>${state.projects.length}</strong><span>cursuri și proiecte</span></div><div><strong>${totalConcepts}</strong><span>concepte indexate</span></div><div><strong>${translatedChunks}/${totalChunks}</strong><span>segmente traduse</span></div></div>
       </section>
-
       ${renderDashboardTabs()}
       ${phaseMessage}
-
-      ${state.dashboardView === "library" ? `
-        <section class="library-toolbar">
-          <div>
-            <h2>Toată biblioteca</h2>
-            <p>Rezultatele includ titluri, rezumate, tag-uri, conținut editat, notițe și traduceri.</p>
-          </div>
-          <div class="library-search-wrap">
-            <span>⌕</span>
-            <input id="library-search" class="input" value="${escapeHtml(state.librarySearch)}" placeholder="Caută în întreaga bibliotecă…" />
-          </div>
-        </section>
-        <section class="library-grid">${renderLibraryCards()}</section>` : `
-        <section class="hero compact-hero">
-          <div class="hero-main">
-            <h1>Administrarea proiectelor</h1>
-            <p>Importă PDF-uri, traduce segmentele și construiește structura de capitole și concepte.</p>
-            <div class="dashboard-actions">
-              <button id="create-project" class="btn btn-primary">＋ Proiect nou</button>
-              <button id="import-backup" class="btn btn-ghost">Importă backup JSON</button>
-              <button id="manage-glossary" class="btn btn-ghost">Glosar (${state.glossary.length})</button>
-            </div>
-          </div>
-          <div class="hero-card">
-            <div class="metric"><span>Proiecte</span><strong>${state.projects.length}</strong></div>
-            <div class="metric"><span>Segmente traduse</span><strong>${translatedChunks}/${totalChunks}</strong></div>
-            <div class="metric"><span>Concepte</span><strong>${totalConcepts}</strong></div>
-          </div>
-        </section>
-        <section class="projects-grid">${renderProjectManagementCards()}</section>`}
+      ${mainContent}
     </main>
   </div>`;
 
@@ -833,29 +989,36 @@ function renderDashboard() {
     input?.focus();
     input?.setSelectionRange(caret, caret);
   });
+  document.querySelector("#graph-search")?.addEventListener("input", (event) => {
+    state.graphSearch = event.target.value;
+    const caret = event.target.selectionStart;
+    renderDashboard();
+    const input = document.querySelector("#graph-search");
+    input?.focus();
+    input?.setSelectionRange(caret, caret);
+  });
+  document.querySelector("#graph-show-chapters")?.addEventListener("change", (event) => {
+    state.graphShowChapters = event.target.checked;
+    renderDashboard();
+  });
+  document.querySelector("#graph-show-lecture")?.addEventListener("change", (event) => {
+    state.graphShowLecture = event.target.checked;
+    renderDashboard();
+  });
+  document.querySelector("#graph-reindex")?.addEventListener("click", reindexAllWikiLinks);
+  document.querySelector("#graph-fit")?.addEventListener("click", () => state.graphNetwork?.fit({ animation: true }));
   document.querySelector("#create-project")?.addEventListener("click", showCreateProjectModal);
   document.querySelector("#empty-create")?.addEventListener("click", showCreateProjectModal);
   document.querySelector("#manage-glossary")?.addEventListener("click", showGlossaryModal);
   document.querySelector("#import-backup")?.addEventListener("click", triggerBackupImport);
 
-  document.querySelectorAll(".open-project").forEach((button) => {
-    button.addEventListener("click", () => openProject(button.dataset.id, { view: "translation" }));
-  });
-  document.querySelectorAll(".open-wiki").forEach((button) => {
-    button.addEventListener("click", () => openProject(button.dataset.id, { view: "wiki" }));
-  });
-  document.querySelectorAll(".open-lecture").forEach((button) => {
-    button.addEventListener("click", () => openProject(button.dataset.id, { view: "lecture" }));
-  });
-  document.querySelectorAll("[data-open-wiki]").forEach((button) => {
-    button.addEventListener("click", () => openProject(button.dataset.openWiki, {
-      view: "wiki",
-      conceptId: button.dataset.conceptId || null,
-    }));
-  });
-  document.querySelectorAll(".delete-project").forEach((button) => {
-    button.addEventListener("click", () => confirmDeleteProject(button.dataset.id));
-  });
+  document.querySelectorAll(".open-project").forEach((button) => button.addEventListener("click", () => openProject(button.dataset.id, { view: "translation" })));
+  document.querySelectorAll(".open-wiki").forEach((button) => button.addEventListener("click", () => openProject(button.dataset.id, { view: "wiki" })));
+  document.querySelectorAll(".open-lecture").forEach((button) => button.addEventListener("click", () => openProject(button.dataset.id, { view: "lecture" })));
+  document.querySelectorAll("[data-open-wiki]").forEach((button) => button.addEventListener("click", () => openProject(button.dataset.openWiki, { view: "wiki", conceptId: button.dataset.conceptId || null })));
+  document.querySelectorAll(".delete-project").forEach((button) => button.addEventListener("click", () => confirmDeleteProject(button.dataset.id)));
+  attachGraphPanelListeners();
+  if (state.dashboardView === "graph") requestAnimationFrame(initializeKnowledgeGraphDashboard);
 }
 
 function showCreateProjectModal() {
@@ -1103,12 +1266,12 @@ function syncProjectHash() {
   window.history.replaceState(null, "", `#${params.toString()}`);
 }
 
-async function openProject(projectId, { view = "translation", conceptId = null } = {}) {
+async function openProject(projectId, { view = "translation", conceptId = null, lectureSectionId = null } = {}) {
   app.innerHTML = `${topbar({ editor: true })}<main class="container-wide"><div class="empty-state"><span class="loader loader-dark"></span> Se încarcă proiectul…</div></main>`;
   attachTopbarListeners();
 
   try {
-    const [project, chunks, glossary, knowledge, lecture] = await Promise.all([
+    const [project, chunks, glossary, knowledge, lecture, backlinks] = await Promise.all([
       getProject(projectId),
       getProjectChunks(projectId),
       listGlossary(),
@@ -1116,6 +1279,9 @@ async function openProject(projectId, { view = "translation", conceptId = null }
       getProjectLectureSections(projectId)
         .then((sections) => ({ sections, setupError: null }))
         .catch((error) => ({ sections: [], setupError: error })),
+      getProjectBacklinks(projectId)
+        .then((items) => ({ items, setupError: null }))
+        .catch((error) => ({ items: [], setupError: error })),
     ]);
     state.currentProject = project;
     state.chunks = chunks;
@@ -1123,10 +1289,13 @@ async function openProject(projectId, { view = "translation", conceptId = null }
     state.chapters = knowledge.chapters;
     state.concepts = knowledge.concepts;
     state.knowledgeSetupError = knowledge.setupError || null;
+    state.projectBacklinks = backlinks.items || [];
+    state.backlinkSetupError = backlinks.setupError || null;
     state.lectureSections = lecture.sections || [];
     state.lectureSetupError = lecture.setupError || null;
     state.lectureCurrentSpread = 0;
     state.lectureEditingSectionId = null;
+    state.lectureFocusSectionId = lectureSectionId || null;
     state.currentIndex = Math.max(0, state.chunks.findIndex((chunk) => chunk.status !== "approved"));
     if (state.currentIndex < 0) state.currentIndex = 0;
     state.chunkSearch = "";
@@ -1152,6 +1321,32 @@ async function openProject(projectId, { view = "translation", conceptId = null }
   } catch (error) {
     toast(error.message || "Nu am putut deschide proiectul.", "error");
     await loadDashboard();
+  }
+}
+
+async function refreshCurrentProjectBacklinks() {
+  if (!state.currentProject || state.backlinkSetupError) return;
+  try {
+    state.projectBacklinks = await getProjectBacklinks(state.currentProject.id);
+  } catch (error) {
+    state.backlinkSetupError = error;
+  }
+}
+
+async function openInternalWikiReference({ title, projectHint = "", sourceProjectId = null }) {
+  try {
+    await flushActiveEdits();
+    const target = await resolveConceptReference({ title, projectHint, sourceProjectId });
+    if (!target?.concept_id) {
+      toast(`Nu am găsit conceptul „${title}”. Verifică titlul sau folosește [[Proiect::Concept]].`, "error", 5200);
+      return;
+    }
+    if (Number(target.candidate_count || 0) > 1 && !projectHint) {
+      toast(`Există mai multe concepte numite „${title}”. Am deschis potrivirea cea mai apropiată; poți folosi [[Proiect::Concept]].`, "default", 5200);
+    }
+    await openProject(target.project_id, { view: "wiki", conceptId: target.concept_id });
+  } catch (error) {
+    toast(error.message || "Nu am putut deschide legătura internă.", "error", 5200);
   }
 }
 
@@ -1959,6 +2154,14 @@ function notesEditorHtml(concept) {
   return sanitizeConceptHtml(concept?.personal_notes || "");
 }
 
+function linkedDisplayHtml(html, sourceProjectId = state.currentProject?.id || "") {
+  return decorateWikiLinksInHtml(sanitizeConceptHtml(html), { sourceProjectId });
+}
+
+function linkedMarkdownDisplay(markdown, sourceProjectId = state.currentProject?.id || "") {
+  return decorateWikiLinksInHtml(markdownToWikiHtml(markdown), { sourceProjectId });
+}
+
 function closestEditorBlock(node, editor) {
   let current = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
   while (current && current !== editor) {
@@ -2067,9 +2270,14 @@ async function persistConceptById(conceptId, { quiet = false } = {}) {
 
   try {
     const sanitized = sanitizeConceptHtml(concept.content_edited || "");
-    const saved = await saveConceptEditor(concept.id, sanitized);
+    const links = serializeWikiLinksForRpc(extractWikiLinksFromHtml(sanitized));
+    const saved = await saveConceptEditor(concept.id, sanitized, links);
     if (!saved) throw new Error("Supabase nu a returnat conceptul salvat.");
+    const linkWarning = saved._linkSyncError;
+    delete saved._linkSyncError;
     Object.assign(concept, saved, { _editorDirty: false });
+    if (linkWarning) toast(`Concept salvat, dar backlink-urile nu au fost indexate: ${linkWarning}`, "error", 5200);
+    else refreshCurrentProjectBacklinks();
     if (concept.id === state.selectedConceptId) {
       setConceptSaveState("Salvat", "saved");
       const revision = document.querySelector("#concept-revision");
@@ -2100,9 +2308,14 @@ async function persistConceptNotesById(conceptId, { quiet = false } = {}) {
   if (concept.id === state.selectedConceptId) setConceptNotesSaveState("Se salvează…", "saving");
   try {
     const sanitized = sanitizeConceptHtml(concept.personal_notes || "");
-    const saved = await saveConceptNotes(concept.id, sanitized);
+    const links = serializeWikiLinksForRpc(extractWikiLinksFromHtml(sanitized));
+    const saved = await saveConceptNotes(concept.id, sanitized, links);
     if (!saved) throw new Error("Supabase nu a returnat notițele salvate.");
+    const linkWarning = saved._linkSyncError;
+    delete saved._linkSyncError;
     Object.assign(concept, saved, { _notesDirty: false });
+    if (linkWarning) toast(`Notițele au fost salvate, dar backlink-urile nu au fost indexate: ${linkWarning}`, "error", 5200);
+    else refreshCurrentProjectBacklinks();
     if (concept.id === state.selectedConceptId) {
       setConceptNotesSaveState("Salvat", "saved");
       const revision = document.querySelector("#concept-notes-revision");
@@ -2160,6 +2373,23 @@ function runConceptEditorCommand(editor, command, value = null) {
   document.execCommand(command, false, value);
   storeConceptEditorSelection(editor);
   editor.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+function wikiReferenceTextFromSelection(editor, savedRange = null) {
+  let selectedText = "";
+  if (savedRange) selectedText = savedRange.toString().trim();
+  if (!selectedText) {
+    const selection = window.getSelection();
+    if (selection?.rangeCount && editor.contains(selection.getRangeAt(0).commonAncestorContainer)) {
+      selectedText = selection.toString().trim();
+    }
+  }
+  const title = window.prompt(
+    "Numele exact al conceptului. Opțional: Proiect::Concept sau Concept|text afișat.",
+    selectedText || "",
+  );
+  if (!title?.trim()) return null;
+  return `[[${title.trim()}]]`;
 }
 
 function renderKnowledgeView() {
@@ -2280,7 +2510,8 @@ function renderKnowledgeView() {
         <button type="button" class="editor-tool" data-editor-command="insertUnorderedList" title="Listă cu puncte">• Listă</button>
         <button type="button" class="editor-tool" data-editor-command="insertOrderedList" title="Listă numerotată">1. Listă</button>
         <button type="button" class="editor-tool" data-editor-block="blockquote" title="Citat">❝</button>
-        <button type="button" class="editor-tool" id="concept-add-link" title="Adaugă link">🔗</button>
+        <button type="button" class="editor-tool" id="concept-add-link" title="Adaugă link web">🔗</button>
+        <button type="button" class="editor-tool wiki-link-tool" id="concept-add-wiki-link" title="Leagă de alt concept">[[ ]]</button>
         <button type="button" class="editor-tool" data-editor-command="unlink" title="Elimină linkul">⛓</button>
         <button type="button" class="editor-tool" data-editor-command="removeFormat" title="Șterge formatarea">Tx</button>
       </div>
@@ -2323,7 +2554,8 @@ function renderKnowledgeView() {
         <span class="toolbar-separator"></span>
         <button type="button" class="editor-tool notes-tool" data-notes-command="insertUnorderedList">• Listă</button>
         <button type="button" class="editor-tool notes-tool" data-notes-command="insertOrderedList">1. Listă</button>
-        <button type="button" class="editor-tool notes-tool" id="concept-notes-add-link" title="Adaugă link">🔗</button>
+        <button type="button" class="editor-tool notes-tool" id="concept-notes-add-link" title="Adaugă link web">🔗</button>
+        <button type="button" class="editor-tool notes-tool wiki-link-tool" id="concept-notes-add-wiki-link" title="Leagă de alt concept">[[ ]]</button>
         <button type="button" class="editor-tool notes-tool" data-notes-command="removeFormat">Tx</button>
       </div>
       <div id="concept-notes-editor" class="concept-notes-editor ${phase3Ready ? "" : "disabled"}" contenteditable="${phase3Ready ? "true" : "false"}" spellcheck="true" data-placeholder="Adaugă aici notițe, întrebări, corelații clinice sau lucruri de verificat…">${notesHtml}</div>
@@ -2480,6 +2712,11 @@ function renderKnowledgeView() {
       }
       runConceptEditorCommand(editor, "createLink", url.trim());
     });
+    document.querySelector("#concept-add-wiki-link")?.addEventListener("click", () => {
+      const wikiText = wikiReferenceTextFromSelection(editor, conceptEditorSelection);
+      if (!wikiText) return;
+      runConceptEditorCommand(editor, "insertText", wikiText);
+    });
 
     document.querySelector("#save-concept-now")?.addEventListener("click", async () => {
       selected.content_edited = editor.innerHTML;
@@ -2555,6 +2792,11 @@ function renderKnowledgeView() {
       }
       runNotesCommand("createLink", url.trim());
     });
+    document.querySelector("#concept-notes-add-wiki-link")?.addEventListener("click", () => {
+      const wikiText = wikiReferenceTextFromSelection(notesEditor, conceptNotesSelection);
+      if (!wikiText) return;
+      runNotesCommand("insertText", wikiText);
+    });
     document.querySelector("#save-concept-notes-now")?.addEventListener("click", async () => {
       selected.personal_notes = notesEditor.innerHTML;
       selected._notesDirty = true;
@@ -2584,8 +2826,8 @@ function wikiConceptHtml(concept) {
   const sourceChunks = state.chunks
     .filter((chunk) => (concept.source_chunk_ids || []).includes(chunk.id))
     .sort((a, b) => a.position - b.position);
-  if (concept.content_edited?.trim()) return sanitizeConceptHtml(concept.content_edited);
-  return markdownToWikiHtml(conceptOriginalText(concept, sourceChunks));
+  if (concept.content_edited?.trim()) return linkedDisplayHtml(concept.content_edited, concept.project_id);
+  return linkedMarkdownDisplay(conceptOriginalText(concept, sourceChunks), concept.project_id);
 }
 
 function wikiConceptSearchText(concept) {
@@ -2608,6 +2850,33 @@ function wikiAnchor(value, prefix = "section") {
     .replace(/^-+|-+$/g, "")
     .slice(0, 70);
   return `${prefix}-${normalized || "item"}`;
+}
+
+function backlinksForConcept(conceptId) {
+  return state.projectBacklinks.filter((item) => item.target_concept_id === conceptId);
+}
+
+function renderConceptBacklinks(concept) {
+  if (state.backlinkSetupError) {
+    return `<section class="wiki-backlinks"><h4>↩ Concepte care menționează această pagină</h4><div class="help">Rulează migrarea Fazei 6 pentru backlink-uri.</div></section>`;
+  }
+  const backlinks = backlinksForConcept(concept.id);
+  return `<section class="wiki-backlinks">
+    <div class="wiki-backlinks-head"><h4>↩ Concepte care menționează această pagină</h4><span>${backlinks.length}</span></div>
+    ${backlinks.length ? `<div class="wiki-backlink-list">${backlinks.map((link) => {
+      const typeLabel = link.source_type === "concept_notes" ? "notițe" : link.source_type === "lecture_section" ? "Lecture" : "concept";
+      const snippet = stripHtmlText(link.source_excerpt || link.source_summary || "").slice(0, 180);
+      const action = link.source_concept_id
+        ? `data-backlink-project="${link.source_project_id}" data-backlink-concept="${link.source_concept_id}"`
+        : `data-backlink-project="${link.source_project_id}" data-backlink-lecture="${link.source_lecture_section_id}"`;
+      return `<button class="wiki-backlink-card" ${action}>
+        <span class="badge">${typeLabel}</span>
+        <strong>${escapeHtml(link.source_title || "Sursă")}</strong>
+        <small>${escapeHtml(link.source_project_title || "")}</small>
+        ${snippet ? `<p>${escapeHtml(snippet)}</p>` : ""}
+      </button>`;
+    }).join("")}</div>` : '<div class="help">Nicio pagină nu menționează încă acest concept. Scrie <code>[[Numele conceptului]]</code> într-un concept, în notițe sau în Lecture Mode.</div>'}
+  </section>`;
 }
 
 function renderWikiView() {
@@ -2655,7 +2924,7 @@ function renderWikiView() {
       <div class="wiki-chapter-content">
         ${chapterMarkdown ? `<details class="wiki-chapter-translation" open>
           <summary><strong>Textul tradus al capitolului</strong><span>${chapterChunks.length} segmente · Markdown păstrat</span></summary>
-          <article class="wiki-rich-content wiki-chapter-markdown">${markdownToWikiHtml(chapterMarkdown)}</article>
+          <article class="wiki-rich-content wiki-chapter-markdown">${linkedMarkdownDisplay(chapterMarkdown, project.id)}</article>
         </details>` : ""}
         <div class="wiki-subchapter-heading"><span>Concepte și subcapitole</span><small>Editările personale apar aici ca pagini proprii.</small></div>
         ${concepts.map((concept) => {
@@ -2667,7 +2936,7 @@ function renderWikiView() {
           const highlightCount = conceptHighlightTotal(concept.content_edited || "");
           const hasCustomPage = Boolean(concept.content_edited?.trim());
           const conceptPage = hasCustomPage
-            ? `<article class="wiki-rich-content">${sanitizeConceptHtml(concept.content_edited)}</article>`
+            ? `<article class="wiki-rich-content">${linkedDisplayHtml(concept.content_edited, concept.project_id)}</article>`
             : `<div class="wiki-concept-unedited">
                 <p>${escapeHtml(concept.summary || "Acest concept a fost identificat în textul tradus al capitolului.")}</p>
                 <span>Conținutul complet se află mai sus, în textul tradus. Folosește „Editează și formatează” pentru a crea o pagină proprie, cu underline și highlights.</span>
@@ -2687,7 +2956,8 @@ function renderWikiView() {
             <div class="wiki-concept-body">
               ${(concept.tags || []).length ? `<div class="knowledge-tags">${concept.tags.map((tag) => `<span>${escapeHtml(tag)}</span>`).join("")}</div>` : ""}
               ${conceptPage}
-              ${state.wikiShowNotes && conceptHasNotes(concept) ? `<aside class="wiki-personal-notes"><h4>📝 Notițele mele</h4><div>${notes}</div></aside>` : ""}
+              ${state.wikiShowNotes && conceptHasNotes(concept) ? `<aside class="wiki-personal-notes"><h4>📝 Notițele mele</h4><div>${linkedDisplayHtml(notes, concept.project_id)}</div></aside>` : ""}
+              ${renderConceptBacklinks(concept)}
               <footer class="wiki-concept-footer">
                 <span>${escapeHtml(pagesLabel(concept.page_start, concept.page_end))}${sourceChunks.length ? ` · ${sourceChunks.length} segmente sursă` : ""}</span>
                 <div>
@@ -2817,6 +3087,19 @@ function renderWikiView() {
     });
   });
 
+  document.querySelectorAll("[data-backlink-concept]").forEach((button) => {
+    button.addEventListener("click", () => openProject(button.dataset.backlinkProject, {
+      view: "wiki",
+      conceptId: button.dataset.backlinkConcept,
+    }));
+  });
+  document.querySelectorAll("[data-backlink-lecture]").forEach((button) => {
+    button.addEventListener("click", () => openProject(button.dataset.backlinkProject, {
+      view: "lecture",
+      lectureSectionId: button.dataset.backlinkLecture,
+    }));
+  });
+
   if (state.wikiFocusConceptId) {
     const focusId = state.wikiFocusConceptId;
     state.wikiFocusConceptId = null;
@@ -2871,8 +3154,8 @@ async function ensureLectureSections({ force = false, quiet = false } = {}) {
 }
 
 function lectureSectionHtml(section) {
-  if (section?.content_edited?.trim()) return sanitizeConceptHtml(section.content_edited);
-  return markdownToWikiHtml(section?.source_markdown || "");
+  if (section?.content_edited?.trim()) return linkedDisplayHtml(section.content_edited, section.project_id);
+  return linkedMarkdownDisplay(section?.source_markdown || "", section.project_id);
 }
 
 function lectureBlockWeight(node) {
@@ -2977,9 +3260,13 @@ async function persistLectureSectionById(sectionId, { quiet = false } = {}) {
   setLectureSaveState("Se salvează…", "saving");
   try {
     const sanitized = sanitizeConceptHtml(section.content_edited || "");
-    const saved = await saveLectureSection(section.id, sanitized);
+    const links = serializeWikiLinksForRpc(extractWikiLinksFromHtml(sanitized));
+    const saved = await saveLectureSection(section.id, sanitized, links);
     if (!saved) throw new Error("Supabase nu a returnat secțiunea salvată.");
+    const linkWarning = saved._linkSyncError;
+    delete saved._linkSyncError;
     Object.assign(section, saved, { _editorDirty: false });
+    if (linkWarning) toast(`Secțiunea a fost salvată, dar backlink-urile nu au fost indexate: ${linkWarning}`, "error", 5200);
     setLectureSaveState("Salvat", "saved");
     const revision = document.querySelector("#lecture-revision");
     const timestamp = document.querySelector("#lecture-last-saved");
@@ -3107,7 +3394,8 @@ function renderLectureSectionEditor(section) {
       <button class="btn btn-ghost btn-sm lecture-tool" data-lecture-command="insertUnorderedList">• Listă</button>
       <button class="btn btn-ghost btn-sm lecture-tool" data-lecture-command="insertOrderedList">1. Listă</button>
       <button class="btn btn-ghost btn-sm lecture-tool" data-lecture-block="blockquote">Citat</button>
-      <button id="lecture-add-link" class="btn btn-ghost btn-sm lecture-tool">Link</button>
+      <button id="lecture-add-link" class="btn btn-ghost btn-sm lecture-tool">Link web</button>
+      <button id="lecture-add-wiki-link" class="btn btn-ghost btn-sm lecture-tool wiki-link-tool">[[Concept]]</button>
       <span class="toolbar-divider"></span>
       <button class="highlight-button important lecture-tool" data-lecture-highlight="important">Important</button>
       <button class="highlight-button definition lecture-tool" data-lecture-highlight="definition">Definiție</button>
@@ -3205,6 +3493,10 @@ function renderLectureView() {
   spreads.forEach((spread, spreadIndex) => spread.forEach((page) => {
     if (!sectionFirstSpread.has(page.section.id)) sectionFirstSpread.set(page.section.id, spreadIndex);
   }));
+  if (state.lectureFocusSectionId && sectionFirstSpread.has(state.lectureFocusSectionId)) {
+    state.lectureCurrentSpread = sectionFirstSpread.get(state.lectureFocusSectionId);
+    state.lectureFocusSectionId = null;
+  }
 
   const spreadsHtml = spreads.map((spread, spreadIndex) => `<section class="lecture-spread" data-spread-index="${spreadIndex}">
     ${spread.map((page) => lecturePageHtml(page, pages.length)).join("")}
@@ -3366,6 +3658,11 @@ function attachLectureEditorListeners(section) {
       return;
     }
     runLectureEditorCommand(editor, "createLink", url.trim());
+  });
+  document.querySelector("#lecture-add-wiki-link")?.addEventListener("click", () => {
+    const wikiText = wikiReferenceTextFromSelection(editor, lectureEditorSelection);
+    if (!wikiText) return;
+    runLectureEditorCommand(editor, "insertText", wikiText);
   });
   document.querySelector("#save-lecture-now")?.addEventListener("click", async () => {
     section.content_edited = editor.innerHTML;
@@ -3833,6 +4130,17 @@ window.addEventListener("hashchange", async () => {
     state.currentProject = null;
     await loadDashboard();
   }
+});
+
+document.addEventListener("click", (event) => {
+  const link = event.target.closest?.("a[data-wiki-link='true']");
+  if (!link) return;
+  event.preventDefault();
+  openInternalWikiReference({
+    title: link.dataset.wikiTarget || "",
+    projectHint: link.dataset.wikiProjectHint || "",
+    sourceProjectId: link.dataset.wikiSourceProject || state.currentProject?.id || null,
+  });
 });
 
 start();

@@ -292,32 +292,103 @@ export async function syncProjectLectureSections(projectId, sections) {
   return Array.isArray(data) ? data : [];
 }
 
-export async function saveLectureSection(sectionId, contentHtml) {
-  const { data, error } = await getSupabase().rpc("save_lecture_section", {
-    p_section_id: sectionId,
-    p_content_html: contentHtml || "",
+export async function syncContentLinks(sourceType, sourceId, links = []) {
+  const { data, error } = await getSupabase().rpc("sync_content_links", {
+    p_source_type: sourceType,
+    p_source_id: sourceId,
+    p_links: links,
   });
   if (error) throw error;
-  return Array.isArray(data) ? data[0] : data;
+  return data ?? [];
+}
+
+async function saveWithLinkIndex(saveOperation, { sourceType, sourceId, links }) {
+  const saved = await saveOperation();
+  try {
+    await syncContentLinks(sourceType, sourceId, links);
+    return saved;
+  } catch (linkError) {
+    // Conținutul este deja salvat. Nu îl marcăm din nou ca nesalvat doar
+    // pentru că indexarea backlink-urilor a eșuat; UI-ul poate avertiza separat.
+    return { ...saved, _linkSyncError: linkError.message || "Indexarea linkurilor a eșuat." };
+  }
+}
+
+export async function saveLectureSection(sectionId, contentHtml, links = []) {
+  return saveWithLinkIndex(async () => {
+    const { data, error } = await getSupabase().rpc("save_lecture_section", {
+      p_section_id: sectionId,
+      p_content_html: contentHtml || "",
+    });
+    if (error) throw error;
+    return Array.isArray(data) ? data[0] : data;
+  }, { sourceType: "lecture_section", sourceId: sectionId, links });
+}
+
+export async function saveConceptEditor(conceptId, contentHtml, links = []) {
+  return saveWithLinkIndex(async () => {
+    const { data, error } = await getSupabase().rpc("save_concept_editor", {
+      p_concept_id: conceptId,
+      p_content_html: contentHtml || "",
+    });
+    if (error) throw error;
+    return Array.isArray(data) ? data[0] : data;
+  }, { sourceType: "concept_content", sourceId: conceptId, links });
+}
+
+export async function saveConceptNotes(conceptId, notesHtml, links = []) {
+  return saveWithLinkIndex(async () => {
+    const { data, error } = await getSupabase().rpc("save_concept_notes", {
+      p_concept_id: conceptId,
+      p_notes_html: notesHtml || "",
+    });
+    if (error) throw error;
+    return Array.isArray(data) ? data[0] : data;
+  }, { sourceType: "concept_notes", sourceId: conceptId, links });
 }
 
 
-export async function saveConceptEditor(conceptId, contentHtml) {
-  const { data, error } = await getSupabase().rpc("save_concept_editor", {
-    p_concept_id: conceptId,
-    p_content_html: contentHtml || "",
-  });
-  if (error) throw error;
-  return Array.isArray(data) ? data[0] : data;
+
+export async function getLinkableSources() {
+  const [conceptsResult, lectureResult] = await Promise.all([
+    getSupabase()
+      .from("concepts")
+      .select("id, project_id, content_edited, personal_notes"),
+    getSupabase()
+      .from("lecture_sections")
+      .select("id, project_id, content_edited, source_markdown, is_archived")
+      .eq("is_archived", false),
+  ]);
+  if (conceptsResult.error) throw conceptsResult.error;
+  if (lectureResult.error) throw lectureResult.error;
+  return {
+    concepts: conceptsResult.data ?? [],
+    lectureSections: lectureResult.data ?? [],
+  };
 }
 
-export async function saveConceptNotes(conceptId, notesHtml) {
-  const { data, error } = await getSupabase().rpc("save_concept_notes", {
-    p_concept_id: conceptId,
-    p_notes_html: notesHtml || "",
+export async function getProjectBacklinks(projectId) {
+  const { data, error } = await getSupabase().rpc("get_project_backlinks", {
+    p_project_id: projectId,
   });
   if (error) throw error;
-  return Array.isArray(data) ? data[0] : data;
+  return data ?? [];
+}
+
+export async function resolveConceptReference({ title, sourceProjectId = null, projectHint = "" }) {
+  const { data, error } = await getSupabase().rpc("resolve_concept_reference", {
+    p_title: title,
+    p_source_project_id: sourceProjectId,
+    p_project_hint: projectHint,
+  });
+  if (error) throw error;
+  return Array.isArray(data) ? data[0] || null : data;
+}
+
+export async function getKnowledgeGraphData() {
+  const { data, error } = await getSupabase().rpc("get_knowledge_graph");
+  if (error) throw error;
+  return data || { projects: [], chapters: [], concepts: [], lecture_sections: [], links: [] };
 }
 
 export async function replaceProjectKnowledge(projectId, chapters) {

@@ -24,3 +24,7 @@ Aplicație web statică pentru traducerea PDF-urilor medicale, organizarea lor �
 - proxy DeepSeek: Supabase Edge Function.
 
 Pentru upgrade-ul curent vezi `FAZA5_LECTURE_MODE_GITHUB.md` și rulează `supabase/phase5_lecture_mode.sql`.
+
+## Faza 6 — Backlinks și Knowledge Graph
+
+Faza 6 adaugă legături interne Obsidian-style prin `[[Concept]]`, backlinks în Wiki și un Knowledge Graph global bazat pe Vis Network. Migrarea se află în `supabase/phase6_knowledge_graph.sql`, iar pașii exacți sunt în `FAZA6_BACKLINKS_KNOWLEDGE_GRAPH_GITHUB.md`.
